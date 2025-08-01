@@ -41,4 +41,4 @@ logs/
 tmp/
 temp/
 
-**/local.settings.json
+local.settings.json
