@@ -1,0 +1,27 @@
+{
+  "name": "shopify-products-extractor",
+  "version": "1.0.0",
+  "description": "Azure Function to extract Shopify products, consumers and orders using GraphQL bulk operations",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "func start",
+    "test": "echo \"No tests specified\""
+  },
+  "dependencies": {
+    "@azure/data-tables": "^13.2.2",
+    "@azure/functions": "^4.5.0",
+    "@azure/identity": "^4.10.2",
+    "@azure/keyvault-secrets": "^4.10.0",
+    "@azure/storage-blob": "^12.17.0",
+    "axios": "^1.6.0",
+    "axios-retry": "^4.5.0",
+    "azure-functions-core-tools": "^4.0.7317",
+    "node-fetch": "^2.7.0",
+    "uuid": "^9.0.0",
+    "winston": "^3.17.0",
+    "winston-daily-rotate-file": "^5.0.0"
+  },
+  "devDependencies": {
+    "azure-functions-core-tools": "4.0.7317"
+  }
+}
