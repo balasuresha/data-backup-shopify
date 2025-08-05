@@ -66,12 +66,12 @@ async function initializeConfiguration() {
 }
 
 // =================== AZURE FUNCTION HANDLERS ===================
-app.timer("shopifyBulkOrderExtraction", {
-    schedule: "0 0 2 * * *", // Daily at 2 AM
-    handler: async (myTimer, context) => {
-        return await shopifyBulkOrderExtractionHandler(context, myTimer);
-    },
-});
+// app.timer("shopifyBulkOrderExtraction", {
+//     schedule: "0 0 2 * * *", // Daily at 2 AM
+//     handler: async (myTimer, context) => {
+//         return await shopifyBulkOrderExtractionHandler(context, myTimer);
+//     },
+// });
 
 app.http("shopifyBulkOrderExtractionHttp", {
     methods: ["POST", "GET"],
