@@ -2,7 +2,7 @@
   "name": "shopify-products-extractor",
   "version": "1.0.0",
   "description": "Azure Function to extract Shopify products, consumers and orders using GraphQL bulk operations",
-  "main": "src/app.js",
+  "main": "src/{index.js,functions/*.js}",
   "scripts": {
     "start": "func start",
     "test": "echo \"No tests specified\""
