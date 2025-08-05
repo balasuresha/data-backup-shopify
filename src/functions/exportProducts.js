@@ -462,7 +462,7 @@ app.http('exportBulkProducts', {
             const shopDomain = config.SHOPIFY_STORE_URL;
             const accessToken = config.SHOPIFY_ACCESS_TOKEN;
             const storageConnectionString = config.AZURE_STORAGE_CONNECTION_STRING;
-            const containerName = config.STORAGE_CONTAINER_NAME;
+            const containerName = config.BLOB_CONTAINER_NAME;
             
             // Debug logging to see what variables are available
             context.info('Configuration check:');
