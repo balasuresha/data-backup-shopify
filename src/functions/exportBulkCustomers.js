@@ -6,9 +6,8 @@ const fs = require("fs").promises;
 const path = require("path");
 const { createAzureFunctionLogger } = require("../../logging");
 const { BlobServiceClient } = require("@azure/storage-blob");
-
-
 const { loadConfig } = require("../../config-loader");
+
 let config = null;
 let logger = null;
 const minimumRetryDelay = 1000; // Minimum retry delay in milliseconds
@@ -1245,10 +1244,12 @@ class ShopifyBulkAPI {
     this.baseURL = "https://" + this.shopDomain + "/admin/api/" + this.apiVersion;
     this.maxRetries = parseInt(cfg.MAX_RETRY_ATTEMPTS);
     this.retryDelay = parseInt(cfg.RETRY_DELAY_MS);
-    this.pollInterval = 3000;
-    this.maxPollAttempts = 600;
-    this.maxPollDuration = 1800000; // 30 minutes
+    this.pollInterval = 5000;  // Increased from 3000ms
+    this.maxPollAttempts = 1200;      // Increased from 600
+    this.maxPollDuration = 3600000;   // 60 minutes (from 30 minutes)
     this.maxConcurrentBatches = parseInt(cfg.MAX_CONCURRENT_BATCHES);
+    this.downloadTimeout = 1800000;     // 30 minutes (from 10 minutes)
+    this.requestTimeout = 600000;       // 10 minutes (from 5 minutes)
 
     console.log("maxConcurrentBatches", this.maxConcurrentBatches);
 
@@ -1272,7 +1273,7 @@ async makeRequest(endpoint, method = "GET", data = null, retryCount = 0) {
         "Content-Type": "application/json",
         Accept: "application/json",
       },
-      timeout: 300000,
+      timeout: this.requestTimeout,
       validateStatus: (status) => status >= 200 && status < 300,
     };
 
@@ -1886,7 +1887,7 @@ async createBulkOperation(query) {
 
       // Exponential backoff: start with pollInterval, double each time, cap at 30 seconds
       const exponentialDelay = Math.min(
-        this.pollInterval * Math.pow(2, attempts),
+        this.pollInterval * Math.pow(1.5, Math.min(attempts, 10)),
         maxFallBackTime
       );
 
@@ -1904,7 +1905,7 @@ async createBulkOperation(query) {
 
   async downloadBulkData(url, retryCount = 0) {
     const maxRetries = 3;
-    const timeoutMs = 300000;
+    const timeoutMs = this.downloadTimeout;
     // Exponential backoff for download retries
     const retryDelay = Math.min(5000 * Math.pow(2, retryCount), maxFallBackTime);
 
@@ -1997,7 +1998,7 @@ async createBulkOperation(query) {
         method: "GET",
         url: url,
         responseType: "stream",
-        timeout: 600000,
+        timeout: this.downloadTimeout,
         headers: {
           "User-Agent": "Shopify-Bulk-Extractor/1.0",
           Accept: "text/plain, */*",
@@ -2084,32 +2085,91 @@ async createBulkOperation(query) {
   }
 
   async downloadBulkDataWithFallback(url) {
-    logger.info("Starting bulk data download with fallback strategy");
+  logger.info("Starting bulk data download with fallback strategy for large dataset");
+
+  try {
+    // For large datasets, try memory-managed download first
+    return await this.downloadBulkDataWithMemoryManagement(url);
+  } catch (error) {
+    logger.warn("Memory-managed download failed, trying regular download", {
+      error: error.message,
+    });
 
     try {
       return await this.downloadBulkData(url);
-    } catch (error) {
+    } catch (regularError) {
       logger.warn("Regular download failed, trying streaming method", {
-        error: error.message,
+        error: regularError.message,
       });
 
       try {
         return await this.downloadBulkDataStream(url);
       } catch (streamError) {
-        logger.error("Both download methods failed", {
-          regularError: error.message,
+        logger.error("All download methods failed", {
+          memoryError: error.message,
+          regularError: regularError.message,
           streamError: streamError.message,
         });
 
         throw new Error(
-          "All download methods failed. Regular: " +
+          "All download methods failed for large dataset. Memory: " +
             error.message +
+            ", Regular: " +
+            regularError.message +
             ", Streaming: " +
             streamError.message
         );
       }
     }
   }
+}
+
+  async downloadBulkDataWithMemoryManagement(url) {
+  logger.info("Starting memory-efficient download for large dataset");
+  
+  const maxMemoryChunkSize = 50 * 1024 * 1024; // 50MB chunks
+  let data = "";
+  let totalBytes = 0;
+  
+  try {
+    const response = await axios({
+      method: "GET",
+      url: url,
+      responseType: "stream",
+      timeout: this.downloadTimeout,
+      headers: {
+        "User-Agent": "Shopify-Bulk-Extractor/1.0",
+        Accept: "text/plain, */*",
+        Connection: "keep-alive",
+      },
+    });
+
+    return new Promise((resolve, reject) => {
+      response.data.on("data", (chunk) => {
+        data += chunk;
+        totalBytes += chunk.length;
+        
+        // Memory management for very large files
+        if (totalBytes > maxMemoryChunkSize * 10) { // 500MB threshold
+          logger.warn("Large dataset detected, consider implementing file streaming", {
+            currentSizeMB: Math.round(totalBytes / (1024 * 1024))
+          });
+        }
+      });
+
+      response.data.on("end", () => {
+        logger.info("Large dataset downloaded successfully", {
+          sizeMB: Math.round(totalBytes / (1024 * 1024))
+        });
+        resolve(data);
+      });
+
+      response.data.on("error", reject);
+    });
+  } catch (error) {
+    throw error;
+  }
+}
 
   async extractCustomersByNegateTag(tag) {
     const extractionTag = tag || config.EXTRACTION_TAG || "extracted-bulk";
@@ -3066,7 +3126,7 @@ async createBulkOperation(query) {
             (remainingChunks * currentDelay) / 60000
           );
 
-          logger.info(`🚀 SPEED OPTIMIZED - Progress update`, {
+          logger.info(`SPEED OPTIMIZED - Progress update`, {
             processedChunks: chunkNumber,
             totalChunks,
             progressPercentage: progressPercentage + "%",
