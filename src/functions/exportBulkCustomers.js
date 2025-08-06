@@ -189,18 +189,19 @@ async function exportBulkCustomers(request, context) {
 
     let requestBody = {};
     try {
-      // Enhanced parsing for Azure Functions compatibility
       if (typeof request.json === "function") {
         try {
           requestBody = await request.json();
           logger.info("Parsed body using request.json()", { requestBody });
         } catch (jsonError) {
-          logger.warn("request.json() failed, trying alternatives", { error: jsonError.message });
-          
-          // Try parsing request.body as string
+          logger.warn("request.json() failed, trying alternatives", {
+            error: jsonError.message,
+          });
           if (request.body && typeof request.body === "string") {
             requestBody = JSON.parse(request.body);
-            logger.info("Parsed body using JSON.parse(request.body)", { requestBody });
+            logger.info("Parsed body using JSON.parse(request.body)", {
+              requestBody,
+            });
           } else if (request.body) {
             requestBody = request.body;
             logger.info("Using request.body directly", { requestBody });
@@ -209,7 +210,6 @@ async function exportBulkCustomers(request, context) {
           }
         }
       } else if (request.body) {
-        // Fallback for other Azure Functions versions
         if (typeof request.body === "string") {
           requestBody = JSON.parse(request.body);
         } else {
@@ -219,26 +219,25 @@ async function exportBulkCustomers(request, context) {
       } else {
         throw new Error("No request body found");
       }
-      
-      // Debug log the final parsed body
+
       logger.info("Final parsed request body", {
         requestBody,
         keys: Object.keys(requestBody),
         hasApproach: !!requestBody.approach,
-        approach: requestBody.approach
+        approach: requestBody.approach,
       });
-      
     } catch (parseError) {
       logger.error("All request body parsing methods failed", {
         error: parseError.message,
         requestHasBody: !!request.body,
         requestBodyType: typeof request.body,
         requestBodyValue: request.body,
-        requestHasJson: typeof request.json === "function"
+        requestHasJson: typeof request.json === "function",
       });
-      
       requestBody = {};
-      logger.warn("Using default request body due to parsing failure", { requestBody });
+      logger.warn("Using default request body due to parsing failure", {
+        requestBody,
+      });
     }
 
     const {
@@ -250,10 +249,9 @@ async function exportBulkCustomers(request, context) {
       validateData = true,
       startDate = null,
       endDate = null,
-      removeTagsAfterUpload = false, // Remove tags after successful upload, default is false
+      removeTagsAfterUpload = false,
     } = requestBody;
 
-    // Log the parsed request
     logger.info("Request parameters parsed", {
       executionId,
       customTag,
@@ -266,36 +264,26 @@ async function exportBulkCustomers(request, context) {
       endDate,
     });
 
-    // Strict validation of approach parameter
     const selectedApproach = validateApproach(rawApproach);
 
-    // Validate approach-specific requirements
     if (selectedApproach === "date-based") {
       if (!startDate || !endDate) {
         throw new Error(
-          "Date-based approach requires both startDate and endDate parameters. Please provide both dates in ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:mm:ssZ)"
+          "Date-based approach requires both startDate and endDate parameters."
         );
       }
-
       const start = new Date(startDate);
       if (isNaN(start.getTime())) {
-        throw new Error(
-          "Invalid startDate format. Use ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:mm:ssZ)"
-        );
+        throw new Error("Invalid startDate format. Use ISO format.");
       }
-
       const end = new Date(endDate);
       if (isNaN(end.getTime())) {
-        throw new Error(
-          "Invalid endDate format. Use ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:mm:ssZ)"
-        );
+        throw new Error("Invalid endDate format. Use ISO format.");
       }
-
       if (start > end) {
         throw new Error("startDate must be before or equal to endDate");
       }
-
-      logger.info("Date range validation passed for date-based approach", {
+      logger.info("Date range validation passed", {
         startDate: start.toISOString(),
         endDate: end.toISOString(),
         rangeDays: Math.ceil((end - start) / (1000 * 60 * 60 * 24)),
@@ -308,8 +296,6 @@ async function exportBulkCustomers(request, context) {
         selectedApproach === "date-based"
           ? { startDate, endDate }
           : "not applicable",
-      validationStrict: true,
-      backwardCompatibility: false,
     });
 
     const shopifyAPI = new ShopifyBulkAPI();
@@ -318,10 +304,11 @@ async function exportBulkCustomers(request, context) {
       executionId,
       approach: selectedApproach,
       startTime: startTime.toISOString(),
-      step1: { customerIds: [], totalCount: 0 },
+      step1: { customerIds: [], totalCount: 0, blobResult: null },
       step2: { taggingResults: null },
-      step3: { extractedCustomers: [], totalCount: 0 },
+      step3: { extractionMethod: null, blobResult: null, totalCount: 0 },
       step4: { azureBlobFile: null },
+      step4_5: { tagRemovalResults: null, cleanupCompleted: false },
       step5: { dataValidation: null },
       downloadUrl: null,
       success: false,
@@ -331,19 +318,16 @@ async function exportBulkCustomers(request, context) {
 
     if (cancelExisting) {
       try {
-        logger.info("Canceling existing bulk operation as requested");
+        logger.info("Canceling existing bulk operation");
         const cancelResult = await shopifyAPI.cancelCurrentBulkOperation();
         if (cancelResult) {
           logger.info("Successfully cancelled existing bulk operation", {
             operationId: cancelResult.id,
             status: cancelResult.status,
           });
-          logger.info("Waiting for cancellation to fully propagate...");
           await shopifyAPI.delay(10000);
         } else {
-          logger.info(
-            "No bulk operation was cancelled (none found or already terminal)"
-          );
+          logger.info("No bulk operation was cancelled");
         }
       } catch (error) {
         logger.warn("Failed to cancel existing bulk operation", {
@@ -352,693 +336,492 @@ async function exportBulkCustomers(request, context) {
       }
     }
 
-    let customerData = null;
-    try {
-      logger.info("Step 1: Extracting customer IDs with basic customer data");
-      const customerResult = await shopifyAPI.getAllCustomerIds();
-      const customerIds = customerResult.customerIds;
-      customerData = customerResult.customerData;
+    // Step 1: Extract customer IDs (only for tag-based approach)
+    if (selectedApproach === "tag-based" && !skipTagging) {
+      try {
+        logger.info("Step 1: Extracting customer IDs with basic customer data");
+        const customerResult = await shopifyAPI.getAllCustomerIds(executionId);
+        results.step1.customerIds = customerResult.customerIds;
+        results.step1.totalCount = customerResult.customerIds.length;
+        results.step1.blobResult = customerResult.blobResult;
 
-      results.step1.customerIds = customerIds;
-      results.step1.totalCount = customerIds.length;
+        logger.info(
+          "Step 1 completed: Streamed customer IDs to Azure Blob Storage",
+          {
+            blobPath: customerResult.blobResult?.blobPath,
+            blobUrl: customerResult.blobResult?.blobUrl,
+            fields: "MINIMAL_NODE_FIELDS (id, legacyResourceId)",
+          }
+        );
 
-      logger.info(
-        "Step 1 completed: Found " + customerIds.length + " customers"
-      );
-
-      if (customerIds.length === 0) {
-        logger.info("No customers found, ending process");
-        results.success = true;
-
-        response = {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-          body: results,
-        };
-
-        context.res = response;
-        return;
+        if (
+          customerResult.customerIds.length === 0 &&
+          !customerResult.blobResult
+        ) {
+          logger.info("No customers found, ending process");
+          results.success = true;
+          response = {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+            body: results,
+          };
+          context.res = response;
+          return response;
+        }
+      } catch (error) {
+        logger.error("Step 1 failed", { error: error.message });
+        results.errors.push({ step: 1, error: error.message });
+        throw error;
       }
-    } catch (error) {
-      logger.error("Step 1 failed", { error: error.message });
-      results.errors.push({ step: 1, error: error.message });
-      throw error;
+    } else {
+      logger.info(
+        "Step 1 skipped: Not required for " + selectedApproach + " approach"
+      );
     }
 
-    if (selectedApproach === "tag-based") {
-      logger.info("Executing tag-based approach with enhanced retry strategy");
+    // Step 2: Tagging
+    if (
+      selectedApproach === "tag-based" &&
+      !skipTagging &&
+      results.step1.customerIds.length > 0
+    ) {
+      try {
+        logger.info("Step 2a: Initial bulk tagging attempt");
+        const initialTaggingResults = await shopifyAPI.bulkTagCustomers(
+          results.step1.customerIds,
+          customTag,
+          null
+        );
 
-      if (!skipTagging && results.step1.customerIds.length > 0) {
-        try {
-          logger.info("Step 2a: Initial bulk tagging attempt");
-          const initialTaggingResults = await shopifyAPI.bulkTagCustomers(
-            results.step1.customerIds,
-            customTag,
-            null
+        results.step2.taggingResults = {
+          successful: initialTaggingResults.successful,
+          failed: initialTaggingResults.failed,
+          errors: initialTaggingResults.errors || [],
+        };
+        results.step2.initialTaggingResults = initialTaggingResults;
+
+        logger.info("Step 2a completed: Initial tagging results", {
+          successful: initialTaggingResults.successful,
+          failed: initialTaggingResults.failed,
+          total: results.step1.customerIds.length,
+          successRate:
+            (
+              (initialTaggingResults.successful /
+                results.step1.customerIds.length) *
+              100
+            ).toFixed(1) + "%",
+        });
+
+        if (initialTaggingResults.failed > 0) {
+          logger.info(
+            "Step 2b: Using negative tag query to identify and tag remaining customers"
           );
+          const untaggedCustomers = await shopifyAPI.getCustomersWithoutTag(
+            customTag,
+            executionId
+          );
+          const untaggedCustomerIds = untaggedCustomers
+            .filter((customer) => customer.legacyResourceId)
+            .map((customer) => customer.legacyResourceId);
 
-          // Initialize results.step2.taggingResults properly
-          results.step2.taggingResults = {
-            successful: initialTaggingResults.successful,
-            failed: initialTaggingResults.failed,
-            errors: initialTaggingResults.errors || [],
-          };
-
-          results.step2.initialTaggingResults = initialTaggingResults;
-
-          logger.info("Step 2a completed: Initial tagging results", {
-            successful: initialTaggingResults.successful,
-            failed: initialTaggingResults.failed,
-            total: results.step1.customerIds.length,
-            successRate:
-              (
-                (initialTaggingResults.successful /
-                  results.step1.customerIds.length) *
-                100
-              ).toFixed(1) + "%",
-          });
-
-          // If there are failures, use negative tag query to find untagged customers
-          if (initialTaggingResults.failed > 0) {
+          if (untaggedCustomerIds.length > 0) {
             logger.info(
-              "Step 2b: Using negative tag query to identify and tag remaining customers"
+              `Step 2b: Tagging ${untaggedCustomerIds.length} remaining customers`
+            );
+            const remainingTaggingResults = await shopifyAPI.bulkTagCustomers(
+              untaggedCustomerIds,
+              customTag,
+              null
             );
 
-            // Get customers who DON'T have the tag using negative query
-            const untaggedCustomers = await shopifyAPI.getCustomersWithoutTag(
-              customTag
-            );
+            const finalSuccessful =
+              initialTaggingResults.successful +
+              remainingTaggingResults.successful;
+            const finalFailed = remainingTaggingResults.failed;
+            const finalSuccessRate = (
+              (finalSuccessful / results.step1.customerIds.length) *
+              100
+            ).toFixed(1);
 
-            if (untaggedCustomers.length > 0) {
-              logger.info(
-                `Found ${untaggedCustomers.length} customers without tag via negative query`
-              );
+            results.step2.negativeQueryResults = {
+              untaggedFound: untaggedCustomers.length,
+              untaggedCustomerIds: untaggedCustomerIds.length,
+              additionalTagged: remainingTaggingResults.successful,
+              stillFailed: remainingTaggingResults.failed,
+              method: "negative_tag_query",
+            };
 
-              // Extract customer IDs from the untagged customers
-              const untaggedCustomerIds = untaggedCustomers
-                .filter((customer) => customer.legacyResourceId)
-                .map((customer) => customer.legacyResourceId);
+            results.step2.taggingResults.finalSuccessful = finalSuccessful;
+            results.step2.taggingResults.finalFailed = finalFailed;
+            results.step2.taggingResults.finalSuccessRate = finalSuccessRate;
 
-              if (untaggedCustomerIds.length > 0) {
-                logger.info(
-                  `Step 2b: Tagging ${untaggedCustomerIds.length} remaining customers`
-                );
-
-                const remainingTaggingResults =
-                  await shopifyAPI.bulkTagCustomers(
-                    untaggedCustomerIds,
-                    customTag,
-                    null
-                  );
-
-                // Combine results - Update the existing taggingResults object
-                const finalSuccessful =
-                  initialTaggingResults.successful +
-                  remainingTaggingResults.successful;
-                const finalFailed = remainingTaggingResults.failed; // Only count final failures
-                const finalSuccessRate = (
-                  (finalSuccessful / results.step1.customerIds.length) *
-                  100
-                ).toFixed(1);
-
-                results.step2.negativeQueryResults = {
-                  untaggedFound: untaggedCustomers.length,
-                  untaggedCustomerIds: untaggedCustomerIds.length,
-                  additionalTagged: remainingTaggingResults.successful,
-                  stillFailed: remainingTaggingResults.failed,
-                  method: "negative_tag_query",
-                };
-
-                // Update the taggingResults object with final values
-                results.step2.taggingResults.finalSuccessful = finalSuccessful;
-                results.step2.taggingResults.finalFailed = finalFailed;
-                results.step2.taggingResults.finalSuccessRate =
-                  finalSuccessRate;
-
-                logger.info(
-                  "Step 2b completed: Negative tag query approach results",
-                  {
-                    initialSuccessful: initialTaggingResults.successful,
-                    additionalTagged: remainingTaggingResults.successful,
-                    finalSuccessful,
-                    finalFailed,
-                    finalSuccessRate: finalSuccessRate + "%",
-                    method: "negative_tag_query",
-                    efficiency: "Direct targeting of untagged customers",
-                  }
-                );
-              } else {
-                logger.info(
-                  "All untagged customers lack legacyResourceId - using initial results"
-                );
-                results.step2.taggingResults.finalSuccessful =
-                  initialTaggingResults.successful;
-                results.step2.taggingResults.finalFailed =
-                  initialTaggingResults.failed;
+            logger.info(
+              "Step 2b completed: Negative tag query approach results",
+              {
+                initialSuccessful: initialTaggingResults.successful,
+                additionalTagged: remainingTaggingResults.successful,
+                finalSuccessful,
+                finalFailed,
+                finalSuccessRate: finalSuccessRate + "%",
               }
-            } else {
-              logger.info(
-                "No customers found without tag - all customers appear to be tagged"
-              );
-              results.step2.taggingResults.finalSuccessful =
-                initialTaggingResults.successful;
-              results.step2.taggingResults.finalFailed = 0; // No actual failures if all are tagged
-            }
+            );
           } else {
             logger.info(
-              "Step 2: Perfect tagging success - no negative query needed"
+              "All untagged customers lack legacyResourceId - using initial results"
             );
             results.step2.taggingResults.finalSuccessful =
               initialTaggingResults.successful;
-            results.step2.taggingResults.finalFailed = 0;
-            results.step2.taggingResults.finalSuccessRate = "100.0";
+            results.step2.taggingResults.finalFailed =
+              initialTaggingResults.failed;
           }
-
-          // Validation logic
-          const finalSuccessful = results.step2.taggingResults.finalSuccessful;
-          const finalFailed = results.step2.taggingResults.finalFailed || 0;
-          const finalSuccessRate = parseFloat(
-            results.step2.taggingResults.finalSuccessRate || "0"
+        } else {
+          logger.info(
+            "Step 2: Perfect tagging success - no negative query needed"
           );
+          results.step2.taggingResults.finalSuccessful =
+            initialTaggingResults.successful;
+          results.step2.taggingResults.finalFailed = 0;
+          results.step2.taggingResults.finalSuccessRate = "100.0";
+        }
 
-          const minimumAcceptableRate = 95; // 95% success rate threshold
+        const finalSuccessful = results.step2.taggingResults.finalSuccessful;
+        const finalFailed = results.step2.taggingResults.finalFailed || 0;
+        const finalSuccessRate = parseFloat(
+          results.step2.taggingResults.finalSuccessRate || "0"
+        );
+        const minimumAcceptableRate = 95;
 
-          if (finalSuccessRate >= minimumAcceptableRate) {
-            logger.info(
-              `Step 2 validation passed: ${finalSuccessRate}% success rate meets ${minimumAcceptableRate}% threshold`,
-              {
-                finalSuccessful,
-                finalFailed,
-                decision: "PROCEED to Step 3",
-                method:
-                  finalFailed === 0
-                    ? "initial_tagging"
-                    : "negative_query_optimization",
-              }
-            );
-          } else {
-            logger.warn(
-              `Step 2 partial success: ${finalSuccessRate}% success rate below ${minimumAcceptableRate}% threshold`,
-              {
-                finalSuccessful,
-                finalFailed,
-                decision: "PROCEED to Step 3 with warning",
-                recommendation:
-                  'Consider using "full" approach for future extractions',
-              }
-            );
-
-            results.errors.push({
-              step: 2,
-              error: `Tagging success rate (${finalSuccessRate}%) below optimal threshold (${minimumAcceptableRate}%). Proceeding with available data.`,
-              severity: "warning",
-              method: "negative_query_approach",
-            });
-          }
-        } catch (error) {
-          logger.error("Step 2 failed with critical exception", {
-            error: error.message,
-            stack: error.stack,
-          });
-
+        if (finalSuccessRate >= minimumAcceptableRate) {
+          logger.info(
+            `Step 2 validation passed: ${finalSuccessRate}% success rate meets ${minimumAcceptableRate}% threshold`,
+            {
+              finalSuccessful,
+              finalFailed,
+              decision: "PROCEED to Step 3",
+            }
+          );
+        } else {
+          logger.warn(
+            `Step 2 partial success: ${finalSuccessRate}% success rate below ${minimumAcceptableRate}% threshold`,
+            {
+              finalSuccessful,
+              finalFailed,
+              decision: "PROCEED to Step 3 with warning",
+            }
+          );
           results.errors.push({
             step: 2,
-            error: error.message,
-            severity: "critical",
-            fallbackStrategy:
-              "Will attempt full extraction instead of tag-based",
+            error: `Tagging success rate (${finalSuccessRate}%) below optimal threshold (${minimumAcceptableRate}%).`,
+            severity: "warning",
           });
-
-          results.step2.useFallbackStrategy = true;
-
-          // Initialize taggingResults even on error to prevent null reference errors later
-          results.step2.taggingResults = {
-            successful: 0,
-            failed: results.step1.customerIds.length,
-            errors: [{ error: error.message }],
-            finalSuccessful: 0,
-            finalFailed: results.step1.customerIds.length,
-            finalSuccessRate: "0",
-          };
         }
-      } else {
-        logger.info("Step 2 skipped: Tagging disabled");
-        // Initialize taggingResults for skipped case to prevent null reference errors
+      } catch (error) {
+        logger.error("Step 2 failed with critical exception", {
+          error: error.message,
+          stack: error.stack,
+        });
+        results.errors.push({
+          step: 2,
+          error: error.message,
+          severity: "critical",
+          fallbackStrategy: "Will attempt full extraction instead of tag-based",
+        });
+        results.step2.useFallbackStrategy = true;
         results.step2.taggingResults = {
           successful: 0,
-          failed: 0,
-          errors: [],
+          failed: results.step1.customerIds.length,
+          errors: [{ error: error.message }],
           finalSuccessful: 0,
-          finalFailed: 0,
+          finalFailed: results.step1.customerIds.length,
           finalSuccessRate: "0",
-          skipped: true,
         };
       }
-      // STEP 3 - Enhanced to handle fallback scenarios with negate tag extraction
-      if (!skipExtraction) {
-        try {
-          let extractedCustomers = [];
-          let extractionMethod = "tag-based";
-          let fallbackReason = null;
+    } else {
+      logger.info(
+        "Step 2 skipped: Tagging not required for " + selectedApproach
+      );
+      results.step2.taggingResults = {
+        successful: 0,
+        failed: 0,
+        errors: [],
+        finalSuccessful: 0,
+        finalFailed: 0,
+        finalSuccessRate: "0",
+        skipped: true,
+      };
+    }
 
-          // Check if we should use fallback strategy (full extraction)
+    // Step 3: Extraction
+    if (!skipExtraction) {
+      try {
+        let blobResult = null;
+        let extractionMethod = selectedApproach;
+        let fallbackReason = null;
+
+        if (selectedApproach === "tag-based") {
           if (results.step2.useFallbackStrategy) {
             logger.info(
-              "Step 3: Using fallback strategy - Full customer data extraction instead of tag-based"
+              "Step 3: Using fallback strategy - Full customer data extraction"
             );
-            extractedCustomers = await shopifyAPI.getAllCustomersFullData();
+            const result = await shopifyAPI.getAllCustomersFullData(
+              executionId
+            );
+            blobResult = result.blobResult;
             extractionMethod = "full-fallback";
             fallbackReason = "Step 2 tagging failed critically";
           } else {
-            // FIXED: Proper logic to get final tagging statistics
-            // Check if we have retry results and final numbers are calculated
             const finalSuccessful =
-              results.step2.taggingResults?.finalSuccessful !== undefined
-                ? results.step2.taggingResults.finalSuccessful
-                : results.step2.taggingResults?.successful || 0;
-
-            const finalFailed =
-              results.step2.taggingResults?.finalFailed !== undefined
-                ? results.step2.taggingResults.finalFailed
-                : results.step2.taggingResults?.failed || 0;
-
+              results.step2.taggingResults?.finalSuccessful || 0;
+            const finalFailed = results.step2.taggingResults?.finalFailed || 0;
             const totalAttempted = finalSuccessful + finalFailed;
             const successRate =
               totalAttempted > 0
                 ? (finalSuccessful / totalAttempted) * 100
                 : 100;
 
-            // INTELLIGENT THRESHOLD LOGIC
-            const SUCCESS_RATE_THRESHOLD = 95; // 95% success rate threshold
-            const FAILURE_COUNT_THRESHOLD = 100; // Don't worry about small numbers of failures
-
             logger.info("Step 3: Evaluating extraction strategy", {
               finalSuccessful,
               finalFailed,
               totalAttempted,
               successRate: successRate.toFixed(1) + "%",
-              successThreshold: SUCCESS_RATE_THRESHOLD + "%",
-              failureCountThreshold: FAILURE_COUNT_THRESHOLD,
-              hasRetryResults: !!results.step2.enhancedRetryResults,
-              decision: "pending_evaluation",
             });
 
-            if (finalFailed > 0) {
+            if (finalSuccessful > 0) {
+              const tagPropagationDelay = Math.min(
+                10000,
+                Math.max(3000, finalSuccessful * 200)
+              ); // 200ms per customer, min 3s, max 10s
               logger.info(
-                "Step 3: Found tagging failures, evaluating approach",
+                "Step 3: Waiting for tag propagation in Shopify's search index",
                 {
-                  failedCount: finalFailed,
-                  successRate: successRate.toFixed(1) + "%",
-                  evaluatingThresholds: true,
+                  taggedCustomers: finalSuccessful,
+                  propagationDelayMs: tagPropagationDelay,
+                  reason:
+                    "Tags need time to be indexed before search queries can find them",
                 }
               );
+              await shopifyAPI.delay(tagPropagationDelay);
+            }
 
-              // Option 1: High success rate OR low absolute failure count - use tag-based
-              if (
-                successRate >= SUCCESS_RATE_THRESHOLD ||
-                finalFailed <= FAILURE_COUNT_THRESHOLD
-              ) {
-                logger.info(
-                  "Step 3: Using tag-based extraction (acceptable failure level)",
-                  {
-                    reason:
-                      successRate >= SUCCESS_RATE_THRESHOLD
-                        ? "high_success_rate"
-                        : "low_failure_count",
-                    successRate: successRate.toFixed(1) + "%",
-                    failedCount: finalFailed,
-                    decision: "TAG_BASED_EXTRACTION",
-                  }
-                );
-
-                extractedCustomers = await shopifyAPI.extractCustomersByTag(
-                  customTag
-                );
-                extractionMethod = "tag-based";
-
-                if (finalFailed <= FAILURE_COUNT_THRESHOLD) {
-                  logger.info(
-                    `Accepting ${finalFailed} failed tags as acceptable loss`,
-                    {
-                      failedCount: finalFailed,
-                      threshold: FAILURE_COUNT_THRESHOLD,
-                      acceptableLoss: true,
-                    }
-                  );
-
-                  results.step3.acceptedLoss = {
-                    count: finalFailed,
-                    reason: "Below failure threshold",
-                    threshold: FAILURE_COUNT_THRESHOLD,
-                    successRate: successRate.toFixed(1) + "%",
-                  };
-                }
-              } else {
-                // Option 2: Low success rate AND high failure count - use hybrid approach
-                logger.info(
-                  "Step 3: Using HYBRID extraction approach due to significant tagging failures",
-                  {
-                    successRate: successRate.toFixed(1) + "%",
-                    failedCount: finalFailed,
-                    successThreshold: SUCCESS_RATE_THRESHOLD + "%",
-                    failureThreshold: FAILURE_COUNT_THRESHOLD,
-                    decision: "HYBRID_EXTRACTION",
-                  }
-                );
-
-                // Extract customers WITH the tag
-                logger.info("Step 3a: Extracting customers WITH the tag");
-                const taggedCustomers = await shopifyAPI.extractCustomersByTag(
-                  customTag
-                );
-
-                // Extract customers WITHOUT the tag (failed-to-tag customers)
-                logger.info(
-                  "Step 3b: Extracting customers WITHOUT the tag (failed-to-tag customers)"
-                );
-                const untaggedCustomers =
-                  await shopifyAPI.extractCustomersByNegateTag(customTag);
-
-                // Combine both results, removing duplicates based on customer ID
-                const combinedCustomers = [...taggedCustomers];
-                const existingIds = new Set(
-                  taggedCustomers.map(
-                    (c) =>
-                      c.legacyResourceId ||
-                      c.id?.replace("gid://shopify/Customer/", "")
-                  )
-                );
-
-                // Add untagged customers that aren't already in the tagged list
-                let addedFromUntagged = 0;
-                untaggedCustomers.forEach((customer) => {
-                  const customerId =
-                    customer.legacyResourceId ||
-                    customer.id?.replace("gid://shopify/Customer/", "");
-                  if (customerId && !existingIds.has(customerId)) {
-                    combinedCustomers.push(customer);
-                    addedFromUntagged++;
-                  }
-                });
-
-                extractedCustomers = combinedCustomers;
-                extractionMethod = "hybrid-tag-and-negate";
-                fallbackReason = `Combined tagged (${taggedCustomers.length}) + untagged (${addedFromUntagged}) customers due to ${finalFailed} tagging failures`;
-
-                logger.info("Step 3: Hybrid extraction completed", {
-                  taggedCustomers: taggedCustomers.length,
-                  untaggedCustomers: untaggedCustomers.length,
-                  addedFromUntagged,
-                  duplicatesSkipped:
-                    untaggedCustomers.length - addedFromUntagged,
-                  totalCombined: combinedCustomers.length,
-                  extractionMethod,
-                  successRate: successRate.toFixed(1) + "%",
-                });
-
-                // Store detailed extraction info
-                results.step3.hybridExtractionDetails = {
-                  taggedCustomersCount: taggedCustomers.length,
-                  untaggedCustomersCount: untaggedCustomers.length,
-                  addedFromUntagged,
-                  duplicatesSkipped:
-                    untaggedCustomers.length - addedFromUntagged,
-                  totalCombined: combinedCustomers.length,
-                  triggerReason: `Success rate ${successRate.toFixed(
-                    1
-                  )}% below ${SUCCESS_RATE_THRESHOLD}% with ${finalFailed} failures above ${FAILURE_COUNT_THRESHOLD}`,
-                };
-              }
-            } else {
-              // Perfect tagging - all customers successfully tagged
+            try {
               logger.info(
-                "Step 3: Perfect tagging success - using standard tag-based extraction"
+                "Step 3: Attempting tag-based extraction with tag: " + customTag
               );
-              extractedCustomers = await shopifyAPI.extractCustomersByTag(
-                customTag
+              const result = await shopifyAPI.extractCustomersByTag(
+                customTag,
+                executionId
               );
+              blobResult = result.blobResult;
               extractionMethod = "tag-based";
-            }
-          }
 
-          results.step3.extractedCustomers = extractedCustomers;
-          results.step3.totalCount = extractedCustomers.length;
-          results.step3.extractionMethod = extractionMethod;
-
-          // Store the final tagging statistics for validation
-          if (results.step2.taggingResults) {
-            results.step3.finalTaggingStats = {
-              finalSuccessful:
-                results.step2.taggingResults.finalSuccessful !== undefined
-                  ? results.step2.taggingResults.finalSuccessful
-                  : results.step2.taggingResults.successful,
-              finalFailed:
-                results.step2.taggingResults.finalFailed !== undefined
-                  ? results.step2.taggingResults.finalFailed
-                  : results.step2.taggingResults.failed,
-            };
-          }
-
-          if (fallbackReason) {
-            results.step3.fallbackReason = fallbackReason;
-          }
-
-          logger.info(
-            "Step 3 completed: Extracted " +
-              extractedCustomers.length +
-              " customers using " +
-              extractionMethod +
-              " method"
-          );
-
-          // Enhanced validation logic based on extraction method
-          if (extractionMethod === "tag-based") {
-            const expectedCount =
-              results.step3.finalTaggingStats?.finalSuccessful || 0;
-            if (
-              expectedCount > 0 &&
-              expectedCount !== extractedCustomers.length
-            ) {
-              const countMismatch = `Tagged ${expectedCount} customers but extracted ${extractedCustomers.length}. This may indicate timing issues or tag conflicts.`;
-              logger.warn("Step 3 count validation warning", {
-                finalTaggedCount: expectedCount,
-                extractedCount: extractedCustomers.length,
-                difference: Math.abs(expectedCount - extractedCustomers.length),
-                message: countMismatch,
-              });
-
-              results.errors.push({
-                step: 3,
-                error: countMismatch,
-                severity: "warning",
-              });
-            }
-          } else if (extractionMethod === "hybrid-tag-and-negate") {
-            const expectedCount = results.step1.totalCount;
-            const coverage = (
-              (extractedCustomers.length / expectedCount) *
-              100
-            ).toFixed(1);
-
-            logger.info("Step 3 hybrid extraction validation", {
-              totalCustomersInStore: expectedCount,
-              extractedCustomers: extractedCustomers.length,
-              coveragePercentage: coverage + "%",
-              extractionMethod,
-              isComplete: extractedCustomers.length >= expectedCount,
-            });
-
-            if (extractedCustomers.length < expectedCount * 0.95) {
-              // Less than 95% coverage
-              const coverageWarning = `Hybrid extraction covered ${
-                extractedCustomers.length
-              }/${expectedCount} customers (${coverage}%). ${
-                expectedCount - extractedCustomers.length
-              } customers may have been missed.`;
-              logger.warn("Step 3 coverage warning", {
-                extractedCount: extractedCustomers.length,
-                totalCustomers: expectedCount,
-                coverage: coverage + "%",
-                message: coverageWarning,
-              });
-
-              results.errors.push({
-                step: 3,
-                error: coverageWarning,
-                severity: "warning",
-                extractionMethod,
-                coverage: coverage + "%",
-              });
-            }
-          } else if (extractionMethod.includes("full-fallback")) {
-            logger.info(
-              "Step 3 fallback validation: Using full extraction count as baseline",
-              {
-                extractedCount: extractedCustomers.length,
-                originalCustomerCount: results.step1.totalCount,
-                fallbackStrategy: "successful",
+              if (!blobResult || !blobResult.success) {
+                throw new Error(
+                  "Tag-based extraction failed - no valid blob result"
+                );
               }
-            );
+
+              logger.info("Step 3: Tag-based extraction successful", {
+                blobPath: blobResult.blobPath,
+                sizeMB: Math.round(blobResult.sizeBytes / (1024 * 1024)),
+                method: "tag-based",
+              });
+            } catch (tagExtractionError) {
+              logger.warn(
+                "Step 3: Tag-based extraction failed, trying fallback approaches",
+                {
+                  error: tagExtractionError.message,
+                  fallbackStrategy: "full extraction due to tag search issues",
+                }
+              );
+
+              try {
+                logger.info(
+                  "Step 3: Using full extraction fallback due to tag search issues"
+                );
+                const result = await shopifyAPI.getAllCustomersFullData(
+                  executionId
+                );
+                blobResult = result.blobResult;
+                extractionMethod = "full-fallback";
+                fallbackReason =
+                  "Tag-based extraction failed, likely due to search index timing issues";
+
+                if (!blobResult || !blobResult.success) {
+                  throw new Error("Full extraction fallback also failed");
+                }
+
+                logger.info("Step 3: Full extraction fallback successful", {
+                  blobPath: blobResult.blobPath,
+                  sizeMB: Math.round(blobResult.sizeBytes / (1024 * 1024)),
+                  method: "full-fallback",
+                  reason: "tag-search-timing-issues",
+                });
+              } catch (fullExtractionError) {
+                logger.error("Step 3: Full extraction fallback failed", {
+                  error: fullExtractionError.message,
+                });
+                throw fullExtractionError;
+              }
+            }
           }
-        } catch (error) {
-          logger.error("Step 3 failed", { error: error.message });
-          results.errors.push({ step: 3, error: error.message });
-        }
-      } else {
-        logger.info("Step 3 skipped: Extraction disabled");
-      }
-    } else if (selectedApproach === "full") {
-      logger.info("Executing full approach");
-
-      logger.info("Step 2 skipped: Full approach does not require tagging");
-
-      if (!skipExtraction) {
-        try {
+        } else if (selectedApproach === "full") {
           logger.info("Step 3: Full customer data extraction");
-          const extractedCustomers = await shopifyAPI.getAllCustomersFullData();
-          results.step3.extractedCustomers = extractedCustomers;
-          results.step3.totalCount = extractedCustomers.length;
-
-          logger.info(
-            "Step 3 completed: Extracted " +
-              extractedCustomers.length +
-              " customers"
-          );
-        } catch (error) {
-          logger.error("Step 3 failed", { error: error.message });
-          results.errors.push({ step: 3, error: error.message });
-        }
-      } else {
-        logger.info("Step 3 skipped: Extraction disabled");
-      }
-    } else if (selectedApproach === "date-based") {
-      logger.info("Executing date-based approach", {
-        startDate,
-        endDate,
-      });
-
-      logger.info(
-        "Step 2 skipped: Date-based approach does not require tagging"
-      );
-
-      if (!skipExtraction) {
-        try {
+          const result = await shopifyAPI.getAllCustomersFullData(executionId);
+          blobResult = result.blobResult;
+          extractionMethod = "full";
+        } else if (selectedApproach === "date-based") {
           logger.info("Step 3: Date-filtered customer data extraction", {
             startDate,
             endDate,
           });
-          const extractedCustomers =
-            await shopifyAPI.getAllCustomersFullDataWithDateFilter(
-              startDate,
-              endDate
-            );
-          results.step3.extractedCustomers = extractedCustomers;
-          results.step3.totalCount = extractedCustomers.length;
-          results.step3.dateFilter = { startDate, endDate };
-
-          logger.info(
-            "Step 3 completed: Extracted " +
-              extractedCustomers.length +
-              " customers with date filter",
-            {
-              startDate,
-              endDate,
-              message:
-                extractedCustomers.length === 0
-                  ? "No customers found within the specified date range"
-                  : "Customers successfully extracted",
-            }
-          );
-        } catch (error) {
-          logger.error("Step 3 failed", { error: error.message });
-          results.errors.push({ step: 3, error: error.message });
-        }
-      } else {
-        logger.info("Step 3 skipped: Extraction disabled");
-      }
-    }
-
-    if (results.step3.extractedCustomers.length > 0) {
-      try {
-        logger.info("Step 4: Saving customer data to Azure Blob Storage");
-
-        const additionalInfo = {};
-        if (selectedApproach === "date-based") {
-          additionalInfo.startDate = startDate;
-          additionalInfo.endDate = endDate;
-        }
-
-        const blobResult = await shopifyAPI.saveCustomersToAzureBlob(
-          results.step3.extractedCustomers,
-          customTag,
-          selectedApproach,
-          additionalInfo
-        );
-        results.step4.azureBlobFile = blobResult;
-
-        // Set download URL to the Azure Blob URL
-        results.downloadUrl = blobResult.blobUrl;
-
-        logger.info(
-          "Step 4 completed: " +
-            (blobResult.operation === "replaced"
-              ? "Replaced existing file and uploaded"
-              : "Uploaded") +
-            " " +
-            blobResult.count +
-            " customers to Azure Blob Storage",
-          {
-            blobPath: blobResult.blobPath,
-            blobUrl: blobResult.blobUrl,
-            sizeKB: Math.round(blobResult.sizeBytes / 1024),
-            sizeMB: Math.round(blobResult.sizeBytes / 1024 / 1024),
-            approach: selectedApproach,
-            containerName: blobResult.containerName,
-            folderStructure: blobResult.folderPath,
-            fileName: blobResult.fileName,
-            operation: blobResult.operation,
-            replacedExisting: blobResult.replacedExisting,
-          }
-        );
-      } catch (error) {
-        logger.error("Step 4 failed", { error: error.message });
-        results.errors.push({ step: 4, error: error.message });
-      }
-    } else {
-      if (selectedApproach === "date-based") {
-        logger.info(
-          "Step 4 skipped: No customers found within the specified date range",
-          {
+          const result = await shopifyAPI.getAllCustomersFullDataWithDateFilter(
             startDate,
             endDate,
-            suggestion:
-              "Try expanding your date range or check if customers have been updated recently",
+            executionId
+          );
+          blobResult = result.blobResult;
+          extractionMethod = "date-based";
+          results.step3.dateFilter = { startDate, endDate };
+        }
+
+        results.step3.extractionMethod = extractionMethod;
+        results.step3.blobResult = blobResult;
+        if (fallbackReason) {
+          results.step3.fallbackReason = fallbackReason;
+        }
+        results.downloadUrl = blobResult?.blobUrl;
+
+        logger.info(
+          "Step 3 completed: Streamed customer data to Azure Blob Storage",
+          {
+            blobPath: blobResult?.blobPath,
+            blobUrl: blobResult?.blobUrl,
+            extractionMethod,
+            fields: "CUSTOMER_NODE_FIELDS", // Always full fields in Step 3
+            success: blobResult?.success || false,
           }
         );
-      } else {
-        logger.info("Step 4 skipped: No customers to save");
+
+        // CRITICAL FIX: Don't fall back to Step 1 if Step 3 succeeds with valid blob
+        if (!blobResult || !blobResult.success) {
+          throw new Error(
+            "No valid blob generated in Step 3 - all extraction methods failed"
+          );
+        }
+      } catch (error) {
+        logger.error("Step 3 failed with all extraction methods", {
+          error: error.message,
+        });
+        results.errors.push({ step: 3, error: error.message });
+
+        // LAST RESORT: Try one more full extraction attempt
+        try {
+          logger.warn("Step 3: Final attempt - emergency full extraction");
+          const emergencyResult = await shopifyAPI.getAllCustomersFullData(
+            executionId
+          );
+
+          if (
+            emergencyResult.blobResult &&
+            emergencyResult.blobResult.success
+          ) {
+            results.step3.blobResult = emergencyResult.blobResult;
+            results.step3.extractionMethod = "emergency-full";
+            results.step3.fallbackReason =
+              "All primary extraction methods failed";
+            results.downloadUrl = emergencyResult.blobResult.blobUrl;
+
+            logger.warn("Step 3: Emergency full extraction successful", {
+              blobPath: emergencyResult.blobResult.blobPath,
+              blobUrl: emergencyResult.blobResult.blobUrl,
+              fields: "CUSTOMER_NODE_FIELDS",
+            });
+          } else {
+            throw new Error("Emergency full extraction also failed");
+          }
+        } catch (emergencyError) {
+          logger.error("Step 3: Emergency extraction failed", {
+            error: emergencyError.message,
+          });
+          throw new Error(
+            "Complete extraction failure - all methods including emergency extraction failed"
+          );
+        }
       }
+    } else {
+      logger.info("Step 3 skipped: Extraction disabled");
+      results.downloadUrl = results.step1.blobResult?.blobUrl;
     }
 
+    if (results.step3.blobResult && results.step3.blobResult.success) {
+      results.step4.azureBlobFile = results.step3.blobResult;
+      logger.info("Step 4: Using Step 3 blob as final output", {
+        blobPath: results.step3.blobResult.blobPath,
+        blobUrl: results.step3.blobResult.blobUrl,
+        extractionMethod: results.step3.extractionMethod,
+        fields: "CUSTOMER_NODE_FIELDS",
+      });
+    } else {
+      logger.error(
+        "Step 4: Step 3 failed to create valid blob with customer data"
+      );
+
+      if (selectedApproach === "tag-based") {
+        try {
+          logger.warn(
+            "Step 4: Attempting emergency full extraction as last resort"
+          );
+          const emergencyResult = await shopifyAPI.getAllCustomersFullData(
+            executionId
+          );
+
+          if (
+            emergencyResult.blobResult &&
+            emergencyResult.blobResult.success
+          ) {
+            results.step4.azureBlobFile = emergencyResult.blobResult;
+            results.downloadUrl = emergencyResult.blobResult.blobUrl;
+            results.step4.emergencyFallback = true;
+
+            logger.warn("Step 4: Emergency full extraction successful", {
+              blobPath: emergencyResult.blobResult.blobPath,
+              blobUrl: emergencyResult.blobResult.blobUrl,
+              fields: "CUSTOMER_NODE_FIELDS",
+              method: "emergency-full-extraction",
+            });
+          } else {
+            throw new Error("Emergency full extraction also failed");
+          }
+        } catch (emergencyError) {
+          logger.error("Step 4: Emergency extraction failed", {
+            error: emergencyError.message,
+          });
+          throw new Error(
+            "Complete extraction failure - Step 3 failed and emergency extraction failed"
+          );
+        }
+      } else {
+        throw new Error("No valid blob available from Step 3 extraction");
+      }
+    }
+    // Step 4.5: Tag Removal
     if (
       removeTagsAfterUpload &&
       selectedApproach === "tag-based" &&
-      results.step4.azureBlobFile &&
-      results.step4.azureBlobFile.success &&
+      results.step4.azureBlobFile?.success &&
       results.step1.customerIds.length > 0
     ) {
       try {
         logger.info(
           "Step 4.5: Starting parallel tag removal after successful upload"
         );
-
         const tagRemovalResults = await shopifyAPI.bulkRemoveCustomerTags(
           results.step1.customerIds,
           customTag
         );
 
         results.step4_5 = {
-          tagRemovalResults: tagRemovalResults,
+          tagRemovalResults,
           cleanupCompleted: true,
         };
 
@@ -1057,8 +840,6 @@ async function exportBulkCustomers(request, context) {
           failed: tagRemovalResults.failed,
           skipped: tagRemovalResults.skipped,
           successRate: removalSuccessRate + "%",
-          tag: customTag,
-          cleanupPurpose: "Prevent tag accumulation in future extractions",
         });
 
         if (tagRemovalResults.failed > 0) {
@@ -1066,9 +847,6 @@ async function exportBulkCustomers(request, context) {
             step: 4.5,
             error: `Tag removal partially failed: ${tagRemovalResults.failed}/${results.step1.customerIds.length} customers still have the tag`,
             severity: "warning",
-            successful: tagRemovalResults.successful,
-            failed: tagRemovalResults.failed,
-            successRate: removalSuccessRate + "%",
           });
         }
       } catch (error) {
@@ -1077,9 +855,7 @@ async function exportBulkCustomers(request, context) {
           step: 4.5,
           error: "Tag removal failed: " + error.message,
           severity: "warning",
-          note: "This does not affect the exported data",
         });
-
         results.step4_5 = {
           tagRemovalResults: null,
           cleanupCompleted: false,
@@ -1087,85 +863,37 @@ async function exportBulkCustomers(request, context) {
         };
       }
     } else {
-      if (selectedApproach !== "tag-based") {
-        logger.info(
-          "Step 4.5 skipped: Tag removal not applicable for " +
-            selectedApproach +
-            " approach"
-        );
-      } else if (!removeTagsAfterUpload) {
-        logger.info(
-          "Step 4.5 skipped: Tag removal disabled (removeTagsAfterUpload = false)"
-        );
-      } else if (skipTagRemoval) {
-        logger.info(
-          "Step 4.5 skipped: Tag removal explicitly disabled (skipTagRemoval = true)"
-        );
-      } else if (
-        !results.step4.azureBlobFile ||
-        !results.step4.azureBlobFile.success
-      ) {
-        logger.info(
-          "Step 4.5 skipped: Upload failed, keeping tags for retry purposes"
-        );
-      } else {
-        logger.info("Step 4.5 skipped: No customers to remove tags from");
-      }
+      logger.info("Step 4.5 skipped: Tag removal not applicable or disabled");
     }
 
-    if (validateData && results.step1.totalCount > 0) {
+    // Step 5: Validation (skipped since data is not in memory)
+    if (
+      validateData &&
+      results.step1.totalCount > 0 &&
+      selectedApproach === "tag-based"
+    ) {
       try {
         logger.info("Step 5: Validating data consistency");
-
-        const additionalInfo = {};
-        if (selectedApproach === "date-based") {
-          additionalInfo.startDate = startDate;
-          additionalInfo.endDate = endDate;
-        }
-
+        const additionalInfo =
+          selectedApproach === "date-based" ? { startDate, endDate } : {};
         const dataValidation = shopifyAPI.validateDataConsistency(
           results.step1.totalCount,
-          results.step3.totalCount,
+          0, // Cannot validate extracted count since data is streamed
           selectedApproach,
           additionalInfo
         );
         results.step5.dataValidation = dataValidation;
 
-        logger.info(
-          "Step 5 completed: Data validation " +
-            (dataValidation.isValid ? "passed" : "failed"),
-          {
-            validation: dataValidation.message,
-            ratio: Math.round(dataValidation.ratio * 100) + "%",
-            difference: dataValidation.difference,
-          }
-        );
-
-        if (!dataValidation.isValid) {
-          results.errors.push({
-            step: 5,
-            error: "Data validation failed: " + dataValidation.message,
-            severity: "warning",
-          });
-        }
+        logger.info("Step 5: Data validation skipped due to streaming", {
+          message:
+            "Cannot validate extracted count as data is streamed directly to blob",
+        });
       } catch (error) {
         logger.error("Step 5 failed", { error: error.message });
         results.errors.push({ step: 5, error: error.message });
       }
     } else {
-      if (
-        results.step1.totalCount > 0 &&
-        results.step3.totalCount === 0 &&
-        selectedApproach === "date-based"
-      ) {
-        logger.info(
-          "Step 5 skipped: No extracted customers to validate (empty date range result)"
-        );
-      } else {
-        logger.info(
-          "Step 5 skipped: Data validation disabled or insufficient data"
-        );
-      }
+      logger.info("Step 5 skipped: Data validation disabled or not applicable");
     }
 
     const endTime = new Date();
@@ -1181,6 +909,11 @@ async function exportBulkCustomers(request, context) {
       success: results.success,
       logFile: logger.logFilePath,
       downloadUrl: results.downloadUrl || "none",
+      finalBlobPath: results.step4.azureBlobFile?.blobPath || "none",
+      finalBlobFields:
+        results.step4.azureBlobFile === results.step3.blobResult
+          ? "CUSTOMER_NODE_FIELDS"
+          : "MINIMAL_NODE_FIELDS",
     });
 
     response = {
@@ -1194,7 +927,6 @@ async function exportBulkCustomers(request, context) {
       error: error.message,
       stack: error.stack,
     });
-
     response = {
       status: 500,
       headers: { "Content-Type": "application/json" },
@@ -1241,15 +973,16 @@ class ShopifyBulkAPI {
     this.shopDomain = cfg.SHOPIFY_STORE_URL;
     this.accessToken = cfg.SHOPIFY_ACCESS_TOKEN;
     this.apiVersion = cfg.SHOPIFY_API_VERSION;
-    this.baseURL = "https://" + this.shopDomain + "/admin/api/" + this.apiVersion;
+    this.baseURL =
+      "https://" + this.shopDomain + "/admin/api/" + this.apiVersion;
     this.maxRetries = parseInt(cfg.MAX_RETRY_ATTEMPTS);
     this.retryDelay = parseInt(cfg.RETRY_DELAY_MS);
-    this.pollInterval = 5000;  // Increased from 3000ms
-    this.maxPollAttempts = 1200;      // Increased from 600
-    this.maxPollDuration = 3600000;   // 60 minutes (from 30 minutes)
+    this.pollInterval = 5000; // Increased from 3000ms
+    this.maxPollAttempts = 1200; // Increased from 600
+    this.maxPollDuration = 3600000; // 60 minutes (from 30 minutes)
     this.maxConcurrentBatches = parseInt(cfg.MAX_CONCURRENT_BATCHES);
-    this.downloadTimeout = 1800000;     // 30 minutes (from 10 minutes)
-    this.requestTimeout = 600000;       // 10 minutes (from 5 minutes)
+    this.downloadTimeout = 1800000; // 30 minutes (from 10 minutes)
+    this.requestTimeout = 600000; // 10 minutes (from 5 minutes)
 
     console.log("maxConcurrentBatches", this.maxConcurrentBatches);
 
@@ -1263,126 +996,131 @@ class ShopifyBulkAPI {
     });
   }
 
-async makeRequest(endpoint, method = "GET", data = null, retryCount = 0) {
-  try {
-    const requestConfig = {
-      method,
-      url: this.baseURL + endpoint,
-      headers: {
-        "X-Shopify-Access-Token": this.accessToken,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      timeout: this.requestTimeout,
-      validateStatus: (status) => status >= 200 && status < 300,
-    };
+  async makeRequest(endpoint, method = "GET", data = null, retryCount = 0) {
+    try {
+      const requestConfig = {
+        method,
+        url: this.baseURL + endpoint,
+        headers: {
+          "X-Shopify-Access-Token": this.accessToken,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        timeout: this.requestTimeout,
+        validateStatus: (status) => status >= 200 && status < 300,
+      };
 
-    if (data) {
-      requestConfig.data = data;
-      
-      // ENHANCED: Log request data for GraphQL debugging
-      if (endpoint.includes("graphql") && data.query) {
-        logger.debug("GraphQL request details", {
+      if (data) {
+        requestConfig.data = data;
+
+        // ENHANCED: Log request data for GraphQL debugging
+        if (endpoint.includes("graphql") && data.query) {
+          logger.debug("GraphQL request details", {
+            endpoint,
+            queryLength: data.query.length,
+            queryStart: data.query.substring(0, 100),
+            retryCount,
+          });
+        }
+      }
+
+      logger.debug("Making " + method + " request to " + endpoint, {
+        retryCount,
+      });
+
+      const response = await axios(requestConfig);
+
+      // ENHANCED: Log GraphQL response structure for debugging
+      if (endpoint.includes("graphql")) {
+        logger.debug("GraphQL response structure", {
+          hasData: !!response.data?.data,
+          hasErrors: !!response.data?.errors,
+          errorCount: response.data?.errors?.length || 0,
+          dataKeys: response.data?.data ? Object.keys(response.data.data) : [],
+        });
+
+        // Log any GraphQL errors
+        if (response.data?.errors) {
+          logger.warn("GraphQL response contains errors", {
+            errors: response.data.errors,
+          });
+        }
+      }
+
+      if (response.headers["x-shopify-shop-api-call-limit"]) {
+        logger.debug("API call limit", {
+          limit: response.headers["x-shopify-shop-api-call-limit"],
+        });
+      }
+
+      return response.data;
+    } catch (error) {
+      const statusCode = error.response?.status;
+      const errorMessage = error.response?.data?.errors || error.message;
+      const responseData = error.response?.data;
+
+      logger.error("Request failed", {
+        endpoint,
+        method,
+        status: statusCode,
+        error: errorMessage,
+        retryCount,
+        responseData: responseData
+          ? JSON.stringify(responseData, null, 2)
+          : null,
+      });
+
+      if (statusCode === 403) {
+        throw new Error(
+          "Access forbidden (403): Check API permissions for " + endpoint
+        );
+      }
+
+      if (statusCode === 401) {
+        throw new Error(
+          "Unauthorized (401): Check Shopify access token validity"
+        );
+      }
+
+      if (statusCode === 400) {
+        logger.error("Bad Request (400) - detailed error info", {
+          responseData: responseData,
+          requestData: data,
           endpoint,
-          queryLength: data.query.length,
-          queryStart: data.query.substring(0, 100),
-          retryCount,
         });
+        throw new Error(
+          "Bad Request (400): " + (errorMessage || "Invalid request format")
+        );
       }
-    }
 
-    logger.debug("Making " + method + " request to " + endpoint, {
-      retryCount,
-    });
-    
-    const response = await axios(requestConfig);
+      if (
+        (statusCode === 429 || statusCode >= 500) &&
+        retryCount < this.maxRetries
+      ) {
+        // Exponential backoff for retry delays
+        const exponentialDelay =
+          statusCode === 429
+            ? Math.min(5000 * Math.pow(2, retryCount), maxFallBackTime)
+            : Math.min(
+                this.retryDelay * Math.pow(2, retryCount),
+                maxFallBackTime
+              );
 
-    // ENHANCED: Log GraphQL response structure for debugging
-    if (endpoint.includes("graphql")) {
-      logger.debug("GraphQL response structure", {
-        hasData: !!response.data?.data,
-        hasErrors: !!response.data?.errors,
-        errorCount: response.data?.errors?.length || 0,
-        dataKeys: response.data?.data ? Object.keys(response.data.data) : [],
-      });
-      
-      // Log any GraphQL errors
-      if (response.data?.errors) {
-        logger.warn("GraphQL response contains errors", {
-          errors: response.data.errors,
+        logger.warn("Retrying request with exponential backoff", {
+          endpoint,
+          retryCount: retryCount + 1,
+          baseDelay: statusCode === 429 ? 5000 : this.retryDelay,
+          exponentialDelay,
+          delayMs: exponentialDelay + "ms",
         });
+
+        await this.delay(exponentialDelay);
+        return this.makeRequest(endpoint, method, data, retryCount + 1);
       }
+
+      throw error;
     }
-
-    if (response.headers["x-shopify-shop-api-call-limit"]) {
-      logger.debug("API call limit", {
-        limit: response.headers["x-shopify-shop-api-call-limit"],
-      });
-    }
-
-    return response.data;
-  } catch (error) {
-    const statusCode = error.response?.status;
-    const errorMessage = error.response?.data?.errors || error.message;
-    const responseData = error.response?.data;
-
-    logger.error("Request failed", {
-      endpoint,
-      method,
-      status: statusCode,
-      error: errorMessage,
-      retryCount,
-      responseData: responseData ? JSON.stringify(responseData, null, 2) : null,
-    });
-
-    if (statusCode === 403) {
-      throw new Error(
-        "Access forbidden (403): Check API permissions for " + endpoint
-      );
-    }
-
-    if (statusCode === 401) {
-      throw new Error(
-        "Unauthorized (401): Check Shopify access token validity"
-      );
-    }
-
-    if (statusCode === 400) {
-      logger.error("Bad Request (400) - detailed error info", {
-        responseData: responseData,
-        requestData: data,
-        endpoint,
-      });
-      throw new Error(
-        "Bad Request (400): " + (errorMessage || "Invalid request format")
-      );
-    }
-
-    if (
-      (statusCode === 429 || statusCode >= 500) &&
-      retryCount < this.maxRetries
-    ) {
-      // Exponential backoff for retry delays
-      const exponentialDelay =
-        statusCode === 429
-          ? Math.min(5000 * Math.pow(2, retryCount), maxFallBackTime)
-          : Math.min(this.retryDelay * Math.pow(2, retryCount), maxFallBackTime);
-
-      logger.warn("Retrying request with exponential backoff", {
-        endpoint,
-        retryCount: retryCount + 1,
-        baseDelay: statusCode === 429 ? 5000 : this.retryDelay,
-        exponentialDelay,
-        delayMs: exponentialDelay + "ms",
-      });
-
-      await this.delay(exponentialDelay);
-      return this.makeRequest(endpoint, method, data, retryCount + 1);
-    }
-
-    throw error;
   }
-}
 
   delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1418,10 +1156,11 @@ async makeRequest(endpoint, method = "GET", data = null, retryCount = 0) {
     }
   }
 
-  async getCustomersWithoutTag(tag) {
+  async getCustomersWithoutTag(tag, executionId) {
     const extractionTag = tag || config.EXTRACTION_TAG || "extracted-bulk";
     logger.info(
-      "Getting customers WITHOUT tag using negative query: " + extractionTag
+      "Getting customers WITHOUT tag using negative query: " + extractionTag,
+      { executionId }
     );
 
     const query = `
@@ -1438,42 +1177,37 @@ async makeRequest(endpoint, method = "GET", data = null, retryCount = 0) {
     }
   `;
 
-    try {
-      const bulkOperation = await this.createBulkOperation(query);
-      const completedOperation = await this.waitForBulkOperation(
-        bulkOperation.id
+    const bulkOperation = await this.createBulkOperation(query);
+    const completedOperation = await this.waitForBulkOperation(
+      bulkOperation.id
+    );
+
+    if (!completedOperation.url) {
+      logger.warn(
+        "Bulk operation completed but no download URL provided for negative tag query",
+        { executionId }
       );
-
-      if (!completedOperation.url) {
-        logger.warn(
-          "Bulk operation completed but no download URL provided for negative tag query"
-        );
-        return [];
-      }
-
-      const bulkData = await this.downloadBulkDataWithFallback(
-        completedOperation.url
-      );
-      const customers = await this.parseBulkData(bulkData);
-
-      logger.info(
-        `Found ${customers.length} customers WITHOUT tag: ${extractionTag}`,
-        {
-          query: `-tag:${extractionTag}`,
-          method: "server_side_filtering",
-          efficiency: "Direct identification of untagged customers",
-        }
-      );
-
-      return customers;
-    } catch (error) {
-      logger.error("Failed to get customers without tag", {
-        error: error.message,
-        tag: extractionTag,
-        query: `-tag:${extractionTag}`,
-      });
-      throw error;
+      return [];
     }
+
+    const blobResult = await this.downloadBulkDataWithFallback(
+      completedOperation.url,
+      extractionTag,
+      "tag-based",
+      executionId
+    );
+
+    logger.info(
+      "Successfully streamed untagged customer IDs to Azure Blob Storage",
+      {
+        blobPath: blobResult.blobPath,
+        blobUrl: blobResult.blobUrl,
+        sizeMB: Math.round(blobResult.sizeBytes / (1024 * 1024)),
+        executionId,
+      }
+    );
+
+    return []; // Return empty array since data is streamed to blob
   }
 
   async cancelCurrentBulkOperation() {
@@ -1563,53 +1297,53 @@ async makeRequest(endpoint, method = "GET", data = null, retryCount = 0) {
     }
   }
 
-async createBulkOperation(query) {
-  logger.info("Creating bulk operation with existing operation check", {
-    queryLength: query.length,
-  });
-
-  try {
-    const currentOperation = await this.getCurrentBulkOperation();
-
-    if (currentOperation) {
-      logger.info("Found existing bulk operation", {
-        operationId: currentOperation.id,
-        status: currentOperation.status,
-        createdAt: currentOperation.createdAt,
-      });
-
-      if (currentOperation.status === "COMPLETED") {
-        logger.info(
-          "Existing bulk operation is completed, will create new one"
-        );
-      } else if (
-        currentOperation.status === "RUNNING" ||
-        currentOperation.status === "CREATED"
-      ) {
-        logger.info(
-          "Existing bulk operation is running, waiting for completion"
-        );
-        return await this.waitForBulkOperation(currentOperation.id);
-      } else if (
-        currentOperation.status === "FAILED" ||
-        currentOperation.status === "CANCELED"
-      ) {
-        logger.info(
-          "Existing bulk operation failed/canceled, creating new one"
-        );
-        await this.delay(2000);
-      }
-    }
-  } catch (error) {
-    logger.warn("Failed to check existing bulk operation", {
-      error: error.message,
+  async createBulkOperation(query) {
+    logger.info("Creating bulk operation with existing operation check", {
+      queryLength: query.length,
     });
-  }
 
-  // FIXED: Escape quotes properly in the GraphQL query
-  const escapedQuery = query.replace(/"/g, '\\"');
-  
-  const mutation = `
+    try {
+      const currentOperation = await this.getCurrentBulkOperation();
+
+      if (currentOperation) {
+        logger.info("Found existing bulk operation", {
+          operationId: currentOperation.id,
+          status: currentOperation.status,
+          createdAt: currentOperation.createdAt,
+        });
+
+        if (currentOperation.status === "COMPLETED") {
+          logger.info(
+            "Existing bulk operation is completed, will create new one"
+          );
+        } else if (
+          currentOperation.status === "RUNNING" ||
+          currentOperation.status === "CREATED"
+        ) {
+          logger.info(
+            "Existing bulk operation is running, waiting for completion"
+          );
+          return await this.waitForBulkOperation(currentOperation.id);
+        } else if (
+          currentOperation.status === "FAILED" ||
+          currentOperation.status === "CANCELED"
+        ) {
+          logger.info(
+            "Existing bulk operation failed/canceled, creating new one"
+          );
+          await this.delay(2000);
+        }
+      }
+    } catch (error) {
+      logger.warn("Failed to check existing bulk operation", {
+        error: error.message,
+      });
+    }
+
+    // FIXED: Escape quotes properly in the GraphQL query
+    const escapedQuery = query.replace(/"/g, '\\"');
+
+    const mutation = `
     mutation {
       bulkOperationRunQuery(
         query: "${escapedQuery}"
@@ -1633,183 +1367,190 @@ async createBulkOperation(query) {
     }
   `;
 
-  try {
-    logger.info("Sending bulk operation creation request...");
-    
-    // ENHANCED: Log the actual request being sent for debugging
-    logger.debug("GraphQL mutation details", {
-      mutationLength: mutation.length,
-      queryLength: query.length,
-      escapedQueryLength: escapedQuery.length,
-      endpoint: "/graphql.json",
-    });
+    try {
+      logger.info("Sending bulk operation creation request...");
 
-    const response = await this.makeRequest("/graphql.json", "POST", {
-      query: mutation,
-    });
-
-    // ENHANCED: Log the full response for debugging
-    logger.debug("Bulk operation creation response received", {
-      hasData: !!response.data,
-      hasBulkOperationRunQuery: !!response.data?.bulkOperationRunQuery,
-      hasBulkOperation: !!response.data?.bulkOperationRunQuery?.bulkOperation,
-      hasUserErrors: !!response.data?.bulkOperationRunQuery?.userErrors,
-      userErrorsLength: response.data?.bulkOperationRunQuery?.userErrors?.length || 0,
-      responseKeys: response.data ? Object.keys(response.data) : [],
-    });
-
-    // ENHANCED: Check for GraphQL errors in the response
-    if (response.errors && response.errors.length > 0) {
-      logger.error("GraphQL errors in bulk operation creation", {
-        errors: response.errors,
-      });
-      throw new Error(
-        "GraphQL errors: " + response.errors.map(e => e.message).join(", ")
-      );
-    }
-
-    // ENHANCED: Check if the response structure is what we expect
-    if (!response.data) {
-      logger.error("No data field in response", {
-        response: JSON.stringify(response, null, 2),
-      });
-      throw new Error("Invalid GraphQL response: missing data field");
-    }
-
-    if (!response.data.bulkOperationRunQuery) {
-      logger.error("No bulkOperationRunQuery field in response.data", {
-        dataKeys: Object.keys(response.data),
-        responseData: JSON.stringify(response.data, null, 2),
-      });
-      throw new Error("Invalid GraphQL response: missing bulkOperationRunQuery field");
-    }
-
-    const bulkOpResult = response.data.bulkOperationRunQuery;
-
-    // Check for user errors first
-    if (bulkOpResult.userErrors && bulkOpResult.userErrors.length > 0) {
-      const errors = bulkOpResult.userErrors;
-      
-      logger.error("User errors in bulk operation creation", {
-        errors: errors,
+      // ENHANCED: Log the actual request being sent for debugging
+      logger.debug("GraphQL mutation details", {
+        mutationLength: mutation.length,
+        queryLength: query.length,
+        escapedQueryLength: escapedQuery.length,
+        endpoint: "/graphql.json",
       });
 
-      const existingOpError = errors.find(
-        (error) =>
-          error.message && error.message.includes("already in progress")
-      );
+      const response = await this.makeRequest("/graphql.json", "POST", {
+        query: mutation,
+      });
 
-      if (existingOpError) {
-        logger.warn("Bulk operation already in progress error received", {
-          error: existingOpError.message,
+      // ENHANCED: Log the full response for debugging
+      logger.debug("Bulk operation creation response received", {
+        hasData: !!response.data,
+        hasBulkOperationRunQuery: !!response.data?.bulkOperationRunQuery,
+        hasBulkOperation: !!response.data?.bulkOperationRunQuery?.bulkOperation,
+        hasUserErrors: !!response.data?.bulkOperationRunQuery?.userErrors,
+        userErrorsLength:
+          response.data?.bulkOperationRunQuery?.userErrors?.length || 0,
+        responseKeys: response.data ? Object.keys(response.data) : [],
+      });
+
+      // ENHANCED: Check for GraphQL errors in the response
+      if (response.errors && response.errors.length > 0) {
+        logger.error("GraphQL errors in bulk operation creation", {
+          errors: response.errors,
+        });
+        throw new Error(
+          "GraphQL errors: " + response.errors.map((e) => e.message).join(", ")
+        );
+      }
+
+      // ENHANCED: Check if the response structure is what we expect
+      if (!response.data) {
+        logger.error("No data field in response", {
+          response: JSON.stringify(response, null, 2),
+        });
+        throw new Error("Invalid GraphQL response: missing data field");
+      }
+
+      if (!response.data.bulkOperationRunQuery) {
+        logger.error("No bulkOperationRunQuery field in response.data", {
+          dataKeys: Object.keys(response.data),
+          responseData: JSON.stringify(response.data, null, 2),
+        });
+        throw new Error(
+          "Invalid GraphQL response: missing bulkOperationRunQuery field"
+        );
+      }
+
+      const bulkOpResult = response.data.bulkOperationRunQuery;
+
+      // Check for user errors first
+      if (bulkOpResult.userErrors && bulkOpResult.userErrors.length > 0) {
+        const errors = bulkOpResult.userErrors;
+
+        logger.error("User errors in bulk operation creation", {
+          errors: errors,
         });
 
-        const match = existingOpError.message.match(
-          /gid:\/\/shopify\/BulkOperation\/(\d+)/
+        const existingOpError = errors.find(
+          (error) =>
+            error.message && error.message.includes("already in progress")
         );
-        if (match) {
-          const operationId = "gid://shopify/BulkOperation/" + match[1];
-          logger.info(
-            "Found existing operation ID in error, waiting for it",
-            { operationId }
-          );
-          return await this.waitForBulkOperation(operationId);
-        }
 
-        logger.info(
-          'Attempting to find current operation after "already in progress" error'
-        );
-        const currentOp = await this.getCurrentBulkOperation();
-        if (
-          currentOp &&
-          (currentOp.status === "RUNNING" || currentOp.status === "CREATED")
-        ) {
-          logger.info("Found running operation, waiting for completion", {
-            operationId: currentOp.id,
+        if (existingOpError) {
+          logger.warn("Bulk operation already in progress error received", {
+            error: existingOpError.message,
           });
-          return await this.waitForBulkOperation(currentOp.id);
-        } else {
-          throw new Error(
-            "Bulk operation already in progress but cannot find the operation to wait for"
+
+          const match = existingOpError.message.match(
+            /gid:\/\/shopify\/BulkOperation\/(\d+)/
           );
-        }
-      }
-
-      throw new Error(
-        "Bulk operation creation failed: " + JSON.stringify(errors)
-      );
-    }
-
-    // ENHANCED: Check for bulk operation with better error messages
-    if (!bulkOpResult.bulkOperation) {
-      logger.error("No bulkOperation field in bulkOperationRunQuery", {
-        bulkOpResultKeys: Object.keys(bulkOpResult),
-        bulkOpResult: JSON.stringify(bulkOpResult, null, 2),
-        hasUserErrors: !!bulkOpResult.userErrors,
-        userErrors: bulkOpResult.userErrors,
-      });
-      
-      // Try to provide more specific error information
-      if (bulkOpResult.userErrors && bulkOpResult.userErrors.length === 0) {
-        throw new Error("Bulk operation creation returned no errors but also no operation. This may indicate a permissions issue or API version incompatibility.");
-      } else {
-        throw new Error("Invalid response from bulk operation creation: missing bulkOperation field");
-      }
-    }
-
-    const operation = bulkOpResult.bulkOperation;
-    
-    logger.info("New bulk operation created successfully", {
-      operationId: operation.id,
-      status: operation.status,
-      createdAt: operation.createdAt,
-    });
-    
-    return operation;
-  } catch (error) {
-    // ENHANCED: Better error handling and logging
-    logger.error("Bulk operation creation failed", {
-      error: error.message,
-      stack: error.stack,
-      queryLength: query.length,
-      mutationLength: mutation.length,
-    });
-
-    if (error.message && error.message.includes("already in progress")) {
-      logger.info(
-        "Bulk operation already in progress, attempting to find and wait for it"
-      );
-
-      try {
-        const currentOp = await this.getCurrentBulkOperation();
-        if (
-          currentOp &&
-          (currentOp.status === "RUNNING" || currentOp.status === "CREATED")
-        ) {
-          logger.info("Found running operation, waiting for completion", {
-            operationId: currentOp.id,
-          });
-          return await this.waitForBulkOperation(currentOp.id);
-        } else {
-          throw new Error(
-            "Bulk operation already in progress but no running operation found"
-          );
-        }
-      } catch (getCurrentError) {
-        logger.error(
-          'Failed to get current operation after "already in progress" error',
-          {
-            error: getCurrentError.message,
+          if (match) {
+            const operationId = "gid://shopify/BulkOperation/" + match[1];
+            logger.info(
+              "Found existing operation ID in error, waiting for it",
+              { operationId }
+            );
+            return await this.waitForBulkOperation(operationId);
           }
-        );
-        throw new Error("Failed to handle existing bulk operation");
-      }
-    }
 
-    // Re-throw the original error with additional context
-    throw new Error(`Bulk operation creation failed: ${error.message}`);
+          logger.info(
+            'Attempting to find current operation after "already in progress" error'
+          );
+          const currentOp = await this.getCurrentBulkOperation();
+          if (
+            currentOp &&
+            (currentOp.status === "RUNNING" || currentOp.status === "CREATED")
+          ) {
+            logger.info("Found running operation, waiting for completion", {
+              operationId: currentOp.id,
+            });
+            return await this.waitForBulkOperation(currentOp.id);
+          } else {
+            throw new Error(
+              "Bulk operation already in progress but cannot find the operation to wait for"
+            );
+          }
+        }
+
+        throw new Error(
+          "Bulk operation creation failed: " + JSON.stringify(errors)
+        );
+      }
+
+      // ENHANCED: Check for bulk operation with better error messages
+      if (!bulkOpResult.bulkOperation) {
+        logger.error("No bulkOperation field in bulkOperationRunQuery", {
+          bulkOpResultKeys: Object.keys(bulkOpResult),
+          bulkOpResult: JSON.stringify(bulkOpResult, null, 2),
+          hasUserErrors: !!bulkOpResult.userErrors,
+          userErrors: bulkOpResult.userErrors,
+        });
+
+        // Try to provide more specific error information
+        if (bulkOpResult.userErrors && bulkOpResult.userErrors.length === 0) {
+          throw new Error(
+            "Bulk operation creation returned no errors but also no operation. This may indicate a permissions issue or API version incompatibility."
+          );
+        } else {
+          throw new Error(
+            "Invalid response from bulk operation creation: missing bulkOperation field"
+          );
+        }
+      }
+
+      const operation = bulkOpResult.bulkOperation;
+
+      logger.info("New bulk operation created successfully", {
+        operationId: operation.id,
+        status: operation.status,
+        createdAt: operation.createdAt,
+      });
+
+      return operation;
+    } catch (error) {
+      // ENHANCED: Better error handling and logging
+      logger.error("Bulk operation creation failed", {
+        error: error.message,
+        stack: error.stack,
+        queryLength: query.length,
+        mutationLength: mutation.length,
+      });
+
+      if (error.message && error.message.includes("already in progress")) {
+        logger.info(
+          "Bulk operation already in progress, attempting to find and wait for it"
+        );
+
+        try {
+          const currentOp = await this.getCurrentBulkOperation();
+          if (
+            currentOp &&
+            (currentOp.status === "RUNNING" || currentOp.status === "CREATED")
+          ) {
+            logger.info("Found running operation, waiting for completion", {
+              operationId: currentOp.id,
+            });
+            return await this.waitForBulkOperation(currentOp.id);
+          } else {
+            throw new Error(
+              "Bulk operation already in progress but no running operation found"
+            );
+          }
+        } catch (getCurrentError) {
+          logger.error(
+            'Failed to get current operation after "already in progress" error',
+            {
+              error: getCurrentError.message,
+            }
+          );
+          throw new Error("Failed to handle existing bulk operation");
+        }
+      }
+
+      // Re-throw the original error with additional context
+      throw new Error(`Bulk operation creation failed: ${error.message}`);
+    }
   }
-}
 
   async getBulkOperationStatus(operationId) {
     const query = `
@@ -1903,94 +1644,69 @@ async createBulkOperation(query) {
     }
   }
 
-  async downloadBulkData(url, retryCount = 0) {
-    const maxRetries = 3;
-    const timeoutMs = this.downloadTimeout;
-    // Exponential backoff for download retries
-    const retryDelay = Math.min(5000 * Math.pow(2, retryCount), maxFallBackTime);
-
-    logger.info("Downloading bulk data", {
-      url: url.substring(0, 100) + "...",
-      attempt: retryCount + 1,
-      maxRetries: maxRetries + 1,
-      timeoutMs,
-      exponentialDelay: retryDelay,
+  async downloadBulkDataWithFallback(
+    url,
+    tag,
+    approach,
+    executionId,
+    additionalInfo = {}
+  ) {
+    logger.info("Starting bulk data streaming directly to Azure Blob Storage", {
+      executionId,
+      approach,
     });
 
+    // Initialize Azure Blob Service Client
+    const blobServiceClient = BlobServiceClient.fromConnectionString(
+      config.AZURE_STORAGE_CONNECTION_STRING
+    );
+    const containerName = config.BLOB_CONTAINER_NAME;
+    const containerClient = blobServiceClient.getContainerClient(containerName);
+
+    // Extract store name from shopDomain
+    const storeName = this.shopDomain
+      .replace(/\.myshopify\.com$/i, "")
+      .replace(/[^a-z0-9]/gi, "_");
+
+    // Create folder structure: storename/customers/executionId/
+    const folderPath = `${storeName}/customers/${executionId}/`;
+
+    // Generate unique file name: storename_customers_executionId_timestamp.jsonl
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const fileName = `${storeName}_customers_${executionId}_${timestamp}_${approach}.jsonl`;
+    const blobPath = folderPath + fileName;
+
+    const blobClient = containerClient.getBlockBlobClient(blobPath);
+    let existingFileFound = false;
+
     try {
-      const response = await axios.get(url, {
-        timeout: timeoutMs,
-        responseType: "text",
-        headers: {
-          "User-Agent": "Shopify-Bulk-Extractor/1.0",
-          Accept: "text/plain, */*",
-          Connection: "keep-alive",
-        },
-        maxRedirects: 5,
-        validateStatus: (status) => status >= 200 && status < 300,
+      const blobProperties = await blobClient.getProperties();
+      existingFileFound = true;
+      logger.info("Existing file found, deleting before stream upload...", {
+        blobPath,
       });
-
-      logger.info("Bulk data downloaded successfully", {
-        sizeBytes: response.data.length,
-        sizeKB: Math.round(response.data.length / 1024),
-        sizeMB: Math.round(response.data.length / (1024 * 1024)),
-        attempt: retryCount + 1,
-      });
-
-      return response.data;
+      await blobClient.delete({ deleteSnapshots: "include" });
+      logger.info("Successfully deleted existing file", { blobPath });
     } catch (error) {
-      const isRetryableError =
-        error.code === "ETIMEDOUT" ||
-        error.code === "ECONNRESET" ||
-        error.code === "ENOTFOUND" ||
-        error.code === "ECONNREFUSED" ||
-        (error.response && error.response.status >= 500) ||
-        (error.response && error.response.status === 429);
-
-      logger.warn("Bulk data download failed", {
-        error: error.message,
-        code: error.code,
-        attempt: retryCount + 1,
-        maxRetries: maxRetries + 1,
-        isRetryable: isRetryableError,
-      });
-
-      if (isRetryableError && retryCount < maxRetries) {
-        logger.info("Retrying download in " + retryDelay + "ms...", {
-          attempt: retryCount + 2,
-          delay: retryDelay,
+      if (error.statusCode === 404) {
+        logger.info("No existing file found - proceeding with stream upload", {
+          blobPath,
         });
-
-        await this.delay(retryDelay);
-        return this.downloadBulkData(url, retryCount + 1);
+      } else {
+        logger.error("Error checking existing blob", {
+          error: error.message,
+          blobPath,
+        });
       }
-
-      const errorMessage =
-        "Failed to download bulk data after " +
-        (retryCount + 1) +
-        " attempts: " +
-        error.message;
-      logger.error("Download failed permanently", {
-        error: errorMessage,
-        finalAttempt: retryCount + 1,
-        errorCode: error.code,
-      });
-
-      throw new Error(errorMessage);
     }
-  }
 
-  async downloadBulkDataStream(url, retryCount = 0) {
-    const maxRetries = 3;
-
-    // Exponential backoff for stream download retries
-    const retryDelay = Math.min(5000 * Math.pow(2, retryCount), maxFallBackTime);
-
-    logger.info("Downloading bulk data using streaming method", {
+    logger.info("Starting streaming download and upload", {
       url: url.substring(0, 100) + "...",
-      attempt: retryCount + 1,
-      maxRetries: maxRetries + 1,
-      exponentialDelay: retryDelay,
+      blobPath,
+      containerName,
+      storeName,
+      fileName,
+      executionId,
     });
 
     try {
@@ -2005,188 +1721,164 @@ async createBulkOperation(query) {
           Connection: "keep-alive",
         },
         maxRedirects: 5,
-        family: 4,
       });
 
-      return new Promise((resolve, reject) => {
-        let data = "";
-        let totalBytes = 0;
-        const startTime = Date.now();
+      // Set blob metadata
+      const metadata = {
+        storeName: storeName,
+        approach: approach || "unknown",
+        executionId,
+        extractionTag: tag || "extracted-bulk",
+        extractedAt: new Date().toISOString(),
+        fileType: "shopify-customers",
+        replacedExisting: existingFileFound.toString(),
+        uploadVersion: "1.0",
+        uploadMethod: "streaming",
+      };
 
-        response.data.on("data", (chunk) => {
-          data += chunk;
-          totalBytes += chunk.length;
-
-          if (totalBytes % (5 * 1024 * 1024) < chunk.length) {
-            logger.debug("Download progress", {
-              downloadedMB: Math.round(totalBytes / (1024 * 1024)),
-              elapsedMs: Date.now() - startTime,
-            });
-          }
-        });
-
-        response.data.on("end", () => {
-          logger.info("Bulk data downloaded successfully via streaming", {
-            sizeBytes: totalBytes,
-            sizeKB: Math.round(totalBytes / 1024),
-            sizeMB: Math.round(totalBytes / (1024 * 1024)),
-            durationMs: Date.now() - startTime,
-            attempt: retryCount + 1,
-          });
-          resolve(data);
-        });
-
-        response.data.on("error", (error) => {
-          logger.error("Stream download error", { error: error.message });
-          reject(error);
-        });
-
-        const timeoutId = setTimeout(() => {
-          response.data.destroy();
-          reject(new Error("Stream download timeout"));
-        }, 600000);
-
-        response.data.on("end", () => clearTimeout(timeoutId));
-        response.data.on("error", () => clearTimeout(timeoutId));
-      });
-    } catch (error) {
-      const isRetryableError =
-        error.code === "ETIMEDOUT" ||
-        error.code === "ECONNRESET" ||
-        error.code === "ENOTFOUND" ||
-        error.code === "ECONNREFUSED" ||
-        error.message.includes("timeout") ||
-        (error.response && error.response.status >= 500);
-
-      logger.warn("Stream download failed", {
-        error: error.message,
-        code: error.code,
-        attempt: retryCount + 1,
-        isRetryable: isRetryableError,
-      });
-
-      if (isRetryableError && retryCount < maxRetries) {
-        logger.info("Retrying stream download in " + retryDelay + "ms...", {
-          attempt: retryCount + 2,
-          delay: retryDelay,
-        });
-
-        await this.delay(retryDelay);
-        return this.downloadBulkDataStream(url, retryCount + 1);
+      if (
+        approach === "date-based" &&
+        additionalInfo.startDate &&
+        additionalInfo.endDate
+      ) {
+        metadata.startDate = additionalInfo.startDate;
+        metadata.endDate = additionalInfo.endDate;
+        metadata.dateFiltered = "true";
       }
 
+      const uploadOptions = {
+        metadata,
+        blobHTTPHeaders: {
+          blobContentType: "application/x-jsonlines",
+        },
+        bufferSize: 8 * 1024 * 1024, // 8MB buffer
+        maxBuffers: 5, // Max 5 buffers in memory
+      };
+
+      // Stream directly to Azure Blob Storage
+      const uploadStartTime = Date.now();
+      let totalBytes = 0;
+
+      // Temporary buffer to sample first few lines for debugging
+      let sampleData = "";
+      let lineCount = 0;
+      const maxSampleLines = 3;
+
+      response.data.on("data", (chunk) => {
+        totalBytes += chunk.length;
+        if (lineCount < maxSampleLines) {
+          sampleData += chunk.toString();
+          const lines = sampleData.split("\n");
+          if (lines.length > maxSampleLines) {
+            sampleData = lines.slice(0, maxSampleLines).join("\n");
+            lineCount = maxSampleLines;
+          }
+        }
+      });
+
+      const uploadResponse = await blobClient.uploadStream(
+        response.data,
+        uploadOptions.bufferSize,
+        uploadOptions.maxBuffers,
+        {
+          metadata: uploadOptions.metadata,
+          blobHTTPHeaders: uploadOptions.blobHTTPHeaders,
+        }
+      );
+
+      const uploadDuration = Date.now() - uploadStartTime;
+      const blobUrl = blobClient.url;
+
+      // Log sample data for debugging
+      logger.debug("Sample of streamed data", {
+        sampleData: sampleData.split("\n").map((line) => {
+          try {
+            const parsed = JSON.parse(line);
+            return {
+              fields: Object.keys(parsed),
+              sampleValues: Object.fromEntries(
+                Object.entries(parsed).slice(0, 3) // Limit to first 3 fields for brevity
+              ),
+            };
+          } catch (e) {
+            return { error: "Failed to parse line: " + e.message };
+          }
+        }),
+        lineCount,
+        blobPath,
+        executionId,
+      });
+
+      logger.info("Successfully streamed data to Azure Blob Storage", {
+        blobPath,
+        blobUrl,
+        requestId: uploadResponse.requestId,
+        etag: uploadResponse.etag,
+        lastModified: uploadResponse.lastModified,
+        sizeBytes: totalBytes,
+        sizeMB: Math.round(totalBytes / (1024 * 1024)),
+        uploadDurationMs: uploadDuration,
+        uploadDurationMinutes: Math.round((uploadDuration / 60000) * 100) / 100,
+        containerName,
+        fileName,
+        replacedExisting: existingFileFound,
+        operation: existingFileFound ? "replaced" : "created",
+        uploadMethod: "streaming",
+        executionId,
+      });
+
+      return {
+        success: true,
+        blobPath,
+        blobUrl,
+        fileName,
+        folderPath,
+        storeName,
+        containerName,
+        sizeBytes: totalBytes,
+        approach: approach || "unknown",
+        replacedExisting: existingFileFound,
+        operation: existingFileFound ? "replaced" : "created",
+        uploadDurationMs: uploadDuration,
+        uploadResponse: {
+          requestId: uploadResponse.requestId,
+          etag: uploadResponse.etag,
+          lastModified: uploadResponse.lastModified,
+        },
+        metadata,
+      };
+    } catch (error) {
+      logger.error("Failed to stream data to Azure Blob Storage", {
+        error: error.message,
+        stack: error.stack,
+        url: url.substring(0, 100) + "...",
+        containerName,
+        blobPath,
+        executionId,
+      });
       throw new Error(
-        "Failed to download bulk data via streaming after " +
-          (retryCount + 1) +
-          " attempts: " +
-          error.message
+        "Failed to stream bulk data to Azure Blob Storage: " + error.message
       );
     }
   }
 
-  async downloadBulkDataWithFallback(url) {
-  logger.info("Starting bulk data download with fallback strategy for large dataset");
-
-  try {
-    // For large datasets, try memory-managed download first
-    return await this.downloadBulkDataWithMemoryManagement(url);
-  } catch (error) {
-    logger.warn("Memory-managed download failed, trying regular download", {
-      error: error.message,
-    });
-
-    try {
-      return await this.downloadBulkData(url);
-    } catch (regularError) {
-      logger.warn("Regular download failed, trying streaming method", {
-        error: regularError.message,
-      });
-
-      try {
-        return await this.downloadBulkDataStream(url);
-      } catch (streamError) {
-        logger.error("All download methods failed", {
-          memoryError: error.message,
-          regularError: regularError.message,
-          streamError: streamError.message,
-        });
-
-        throw new Error(
-          "All download methods failed for large dataset. Memory: " +
-            error.message +
-            ", Regular: " +
-            regularError.message +
-            ", Streaming: " +
-            streamError.message
-        );
-      }
-    }
-  }
-}
-
-  async downloadBulkDataWithMemoryManagement(url) {
-  logger.info("Starting memory-efficient download for large dataset");
-  
-  const maxMemoryChunkSize = 50 * 1024 * 1024; // 50MB chunks
-  let data = "";
-  let totalBytes = 0;
-  
-  try {
-    const response = await axios({
-      method: "GET",
-      url: url,
-      responseType: "stream",
-      timeout: this.downloadTimeout,
-      headers: {
-        "User-Agent": "Shopify-Bulk-Extractor/1.0",
-        Accept: "text/plain, */*",
-        Connection: "keep-alive",
-      },
-    });
-
-    return new Promise((resolve, reject) => {
-      response.data.on("data", (chunk) => {
-        data += chunk;
-        totalBytes += chunk.length;
-        
-        // Memory management for very large files
-        if (totalBytes > maxMemoryChunkSize * 10) { // 500MB threshold
-          logger.warn("Large dataset detected, consider implementing file streaming", {
-            currentSizeMB: Math.round(totalBytes / (1024 * 1024))
-          });
-        }
-      });
-
-      response.data.on("end", () => {
-        logger.info("Large dataset downloaded successfully", {
-          sizeMB: Math.round(totalBytes / (1024 * 1024))
-        });
-        resolve(data);
-      });
-
-      response.data.on("error", reject);
-    });
-  } catch (error) {
-    throw error;
-  }
-}
-
-  async extractCustomersByNegateTag(tag) {
+  async extractCustomersByNegateTag(tag, executionId) {
     const extractionTag = tag || config.EXTRACTION_TAG || "extracted-bulk";
     logger.info(
-      "Starting customer extraction WITHOUT tag (negate): " + extractionTag
+      "Starting customer extraction WITHOUT tag (negate): " + extractionTag,
+      { executionId }
     );
 
     const query = `
-            {
-            customers(query: "NOT tag:${extractionTag}") {
-                edges {
-                node {${CUSTOMER_NODE_FIELDS}
-                }
-                }
-            }
-            }
-        `;
+    {
+      customers(query: "NOT tag:${extractionTag}") {
+        edges {
+          node {${CUSTOMER_NODE_FIELDS}
+          }
+        }
+      }
+    }
+  `;
 
     const bulkOperation = await this.createBulkOperation(query);
     const completedOperation = await this.waitForBulkOperation(
@@ -2195,23 +1887,30 @@ async createBulkOperation(query) {
 
     if (!completedOperation.url) {
       logger.warn(
-        "Bulk operation completed but no download URL provided for negate tag extraction"
+        "Bulk operation completed but no download URL provided for negate tag extraction",
+        { executionId }
       );
-      return [];
+      return { blobResult: null };
     }
 
-    const bulkData = await this.downloadBulkDataWithFallback(
-      completedOperation.url
+    const blobResult = await this.downloadBulkDataWithFallback(
+      completedOperation.url,
+      extractionTag,
+      "tag-based",
+      executionId
     );
-    const customers = await this.parseBulkData(bulkData);
 
     logger.info(
-      "Extracted " +
-        customers.length +
-        " customers WITHOUT tag: " +
-        extractionTag
+      "Successfully streamed untagged customer data to Azure Blob Storage",
+      {
+        blobPath: blobResult.blobPath,
+        blobUrl: blobResult.blobUrl,
+        sizeMB: Math.round(blobResult.sizeBytes / (1024 * 1024)),
+        executionId,
+      }
     );
-    return customers;
+
+    return { blobResult };
   }
 
   async bulkRemoveCustomerTags(customerIds, tag) {
@@ -2645,94 +2344,93 @@ async createBulkOperation(query) {
     }
   }
 
-  async parseBulkData(data) {
-    const lines = data.trim().split("\n");
-    const records = [];
-    let parseErrors = 0;
-
-    logger.info("Parsing bulk data", { totalLines: lines.length });
-
-    for (const line of lines) {
-      if (line.trim()) {
-        try {
-          const record = JSON.parse(line);
-          if (record) {
-            records.push(record);
-          }
-        } catch (error) {
-          parseErrors++;
-          if (parseErrors <= 5) {
-            logger.warn("Failed to parse line", {
-              line: line.substring(0, 100),
-              error: error.message,
-            });
-          }
-        }
-      }
-    }
-
-    if (parseErrors > 0) {
-      logger.warn("Parse errors encountered", {
-        total: parseErrors,
-        successful: records.length,
-      });
-    }
-
-    return records;
-  }
-
-  async getAllCustomerIds() {
-    logger.info("Starting customer ID extraction");
+  async getAllCustomerIds(executionId) {
+    logger.info("Starting customer ID extraction", { executionId });
     const query = `
     {
-    customers {
+      customers {
         edges {
-            node {${MINIMAL_NODE_FIELDS}
+          node {${MINIMAL_NODE_FIELDS}
+          }
         }
+      }
+    }
+  `;
+
+    try {
+      const bulkOperation = await this.createBulkOperation(query);
+      const completedOperation = await this.waitForBulkOperation(
+        bulkOperation.id
+      );
+
+      if (!completedOperation.url) {
+        throw new Error(
+          "Bulk operation completed but no download URL provided"
+        );
+      }
+
+      logger.info("Downloading customer IDs for tagging purposes only");
+
+      const response = await axios({
+        method: "GET",
+        url: completedOperation.url,
+        timeout: this.downloadTimeout,
+        headers: {
+          "User-Agent": "Shopify-Bulk-Extractor/1.0",
+          Accept: "text/plain, */*",
+        },
+      });
+
+      const customerIds = [];
+      const lines = response.data.split("\n").filter((line) => line.trim());
+
+      for (const line of lines) {
+        try {
+          const customer = JSON.parse(line);
+          if (customer.legacyResourceId) {
+            customerIds.push(customer.legacyResourceId);
+          }
+        } catch (parseError) {
+          logger.debug("Skipping invalid JSON line", {
+            line: line.substring(0, 100),
+          });
         }
+      }
+
+      logger.info("Successfully extracted customer IDs for tagging", {
+        totalCustomers: customerIds.length,
+        executionId,
+        note: "No blob created in Step 1 - IDs only used for tagging",
+      });
+
+      return {
+        customerIds, // Return actual IDs for tagging
+        customerData: [],
+        blobResult: null, // IMPORTANT: No blob in Step 1
+      };
+    } catch (error) {
+      logger.error("Failed to extract customer IDs", {
+        error: error.message,
+        executionId,
+      });
+      throw error;
     }
-    }
-    `;
-    const bulkOperation = await this.createBulkOperation(query);
-    const completedOperation = await this.waitForBulkOperation(
-      bulkOperation.id
-    );
-
-    if (!completedOperation.url) {
-      throw new Error("Bulk operation completed but no download URL provided");
-    }
-
-    const bulkData = await this.downloadBulkDataWithFallback(
-      completedOperation.url
-    );
-    const customers = await this.parseBulkData(bulkData);
-
-    const customerIds = customers
-      .filter((customer) => customer.legacyResourceId)
-      .map((customer) => customer.legacyResourceId);
-
-    logger.info(
-      "Successfully extracted " + customerIds.length + " customer IDs"
-    );
-
-    return {
-      customerIds,
-      customerData: customers,
-    };
   }
 
-  async getAllCustomersFullData() {
-    logger.info("Starting full customer data extraction (Full Approach)");
+  async getAllCustomersFullData(executionId) {
+    logger.info("Starting full customer data extraction (Full Approach)", {
+      executionId,
+    });
     const query = `
-        {
-        customers {
-            edges {
-            node {${CUSTOMER_NODE_FIELDS}
-            }
-            }
+    {
+      customers {
+        edges {
+          node {${CUSTOMER_NODE_FIELDS}
+          }
         }
-        }
-    `;
+      }
+    }
+  `;
     const bulkOperation = await this.createBulkOperation(query);
     const completedOperation = await this.waitForBulkOperation(
       bulkOperation.id
@@ -2742,32 +2440,35 @@ async createBulkOperation(query) {
       throw new Error("Bulk operation completed but no download URL provided");
     }
 
-    const bulkData = await this.downloadBulkDataWithFallback(
-      completedOperation.url
+    const blobResult = await this.downloadBulkDataWithFallback(
+      completedOperation.url,
+      config.EXTRACTION_TAG || "extracted-bulk",
+      "full",
+      executionId
     );
-    const customers = await this.parseBulkData(bulkData);
 
     logger.info(
-      "Successfully extracted " +
-        customers.length +
-        " complete customer records (Full Approach)"
+      "Successfully streamed full customer data to Azure Blob Storage",
+      {
+        blobPath: blobResult.blobPath,
+        blobUrl: blobResult.blobUrl,
+        sizeMB: Math.round(blobResult.sizeBytes / (1024 * 1024)),
+        executionId,
+      }
     );
-    return customers;
+
+    return { blobResult }; // Return blob metadata
   }
 
-  async getAllCustomersFullDataWithDateFilter(startDate, endDate) {
+  async getAllCustomersFullDataWithDateFilter(startDate, endDate, executionId) {
     logger.info(
       "Starting full customer data extraction with date filter (Date-based Approach)",
-      {
-        startDate,
-        endDate,
-      }
+      { startDate, endDate, executionId }
     );
 
     const start = new Date(startDate).toISOString();
     const end = new Date(endDate).toISOString();
-    const dateFilter =
-      "updated_at:>='" + start + "' AND updated_at:<='" + end + "'";
+    const dateFilter = `updated_at:>='${start}' AND updated_at:<='${end}'`;
 
     logger.info("Date filter applied for SERVER-SIDE filtering", {
       startDate: start,
@@ -2776,23 +2477,9 @@ async createBulkOperation(query) {
       dateRangeDays: Math.ceil(
         (new Date(end) - new Date(start)) / (1000 * 60 * 60 * 24)
       ),
-      note: "This filter is applied by Shopify GraphQL bulk API on the server side",
+      executionId,
     });
 
-    // Log a warning about potential empty results
-    const rangeDays = Math.ceil(
-      (new Date(end) - new Date(start)) / (1000 * 60 * 60 * 24)
-    );
-    if (rangeDays < 30) {
-      logger.warn(
-        "Date range is less than 30 days - this might result in few or no customers",
-        {
-          rangeDays,
-          suggestion:
-            "Consider expanding the date range if no results are found",
-        }
-      );
-    }
     const query = `
     {
       customers(query: "${dateFilter}") {
@@ -2805,10 +2492,10 @@ async createBulkOperation(query) {
   `;
 
     logger.info("Creating bulk operation with SERVER-SIDE date filter query", {
-      queryContains: 'customers(query: "' + dateFilter + '"...)',
+      queryContains: `customers(query: "${dateFilter}"...)`,
       bulkProcessing:
         "Shopify will only process customers matching the date filter",
-      efficiency: "No full extraction - only filtered records are processed",
+      executionId,
     });
 
     const bulkOperation = await this.createBulkOperation(query);
@@ -2821,53 +2508,43 @@ async createBulkOperation(query) {
       objectCount: completedOperation.objectCount,
       fileSize: completedOperation.fileSize,
       hasUrl: !!completedOperation.url,
-      dateFilter: dateFilter,
-      processingNote:
-        "Shopify processed only customers matching: " + dateFilter,
+      dateFilter,
+      executionId,
     });
 
-    // Handle case where no customers match the date filter
     if (completedOperation.objectCount === 0 || !completedOperation.url) {
-      logger.info(
-        "No customers found matching the date filter - Shopify returned 0 records",
-        {
-          dateFilter,
-          startDate: start,
-          endDate: end,
-          rangeDays,
-          objectCount: completedOperation.objectCount,
-          serverSideFiltering:
-            "Shopify bulk API filtered on server - no unnecessary data processed",
-          message: "No customers were updated within the specified date range",
-        }
-      );
-
-      // Return empty array instead of throwing error
-      return [];
-    }
-
-    const bulkData = await this.downloadBulkDataWithFallback(
-      completedOperation.url
-    );
-    const customers = await this.parseBulkData(bulkData);
-
-    logger.info(
-      "Successfully extracted " +
-        customers.length +
-        " complete customer records with SERVER-SIDE date filter (Date-based Approach)",
-      {
+      logger.info("No customers found matching the date filter", {
+        dateFilter,
         startDate: start,
         endDate: end,
+        objectCount: completedOperation.objectCount,
+        executionId,
+      });
+      return { blobResult: null };
+    }
+
+    const blobResult = await this.downloadBulkDataWithFallback(
+      completedOperation.url,
+      config.EXTRACTION_TAG || "extracted-bulk",
+      "date-based",
+      executionId,
+      { startDate, endDate }
+    );
+
+    logger.info(
+      "Successfully streamed customer data with date filter to Azure Blob Storage",
+      {
+        blobPath: blobResult.blobPath,
+        blobUrl: blobResult.blobUrl,
+        sizeMB: Math.round(blobResult.sizeBytes / (1024 * 1024)),
+        startDate,
+        endDate,
         dateFilter,
-        rangeDays,
-        serverSideFiltering:
-          "Shopify bulk API only processed matching customers",
-        efficiency:
-          "No full extraction performed - only filtered data downloaded",
+        executionId,
       }
     );
 
-    return customers;
+    return { blobResult };
   }
 
   async bulkTagCustomers(customerIds, tag, existingCustomerData = null) {
@@ -3419,7 +3096,10 @@ async createBulkOperation(query) {
         }
 
         // Wait before next retry even on error
-        const delayMs = Math.min(5000 * Math.pow(2, retry - 1), maxFallBackTime);
+        const delayMs = Math.min(
+          5000 * Math.pow(2, retry - 1),
+          maxFallBackTime
+        );
         logger.info(
           `Waiting ${delayMs}ms before next retry attempt after error...`
         );
@@ -3466,9 +3146,11 @@ async createBulkOperation(query) {
     return finalResult;
   }
 
-  async extractCustomersByTag(tag) {
+  async extractCustomersByTag(tag, executionId) {
     const extractionTag = tag || config.EXTRACTION_TAG || "extracted-bulk";
-    logger.info("Starting customer extraction with tag: " + extractionTag);
+    logger.info("Starting customer extraction with tag: " + extractionTag, {
+      executionId,
+    });
 
     const query = `
     {
@@ -3481,17 +3163,126 @@ async createBulkOperation(query) {
     }
   `;
 
-    const bulkOperation = await this.createBulkOperation(query);
-    const completedOperation = await this.waitForBulkOperation(
-      bulkOperation.id
-    );
-    const bulkData = await this.downloadBulkDataWithFallback(
-      completedOperation.url
-    );
-    const customers = await this.parseBulkData(bulkData);
+    try {
+      logger.info("Creating bulk operation for tag-based extraction", {
+        tag: extractionTag,
+        queryLength: query.length,
+        executionId,
+      });
 
-    logger.info("Extracted " + customers.length + " complete customer records");
-    return customers;
+      const bulkOperation = await this.createBulkOperation(query);
+
+      if (!bulkOperation || !bulkOperation.id) {
+        throw new Error("Failed to create bulk operation for tag extraction");
+      }
+
+      logger.info("Waiting for bulk operation completion", {
+        operationId: bulkOperation.id,
+        tag: extractionTag,
+        executionId,
+      });
+
+      const completedOperation = await this.waitForBulkOperation(
+        bulkOperation.id
+      );
+
+      if (!completedOperation) {
+        throw new Error("Bulk operation failed to complete");
+      }
+
+      if (completedOperation.status === "FAILED") {
+        throw new Error(
+          "Bulk operation failed: " +
+            (completedOperation.errorCode || "Unknown error")
+        );
+      }
+
+      // CRITICAL FIX: Better handling of 0 customers found case
+      if (completedOperation.objectCount === 0) {
+        logger.warn("No customers found with the specified tag", {
+          tag: extractionTag,
+          operationId: completedOperation.id,
+          status: completedOperation.status,
+          possibleCauses: [
+            "Tag propagation delay - tags not yet indexed",
+            "All customers were untagged before extraction",
+            "Tag name mismatch or typo",
+          ],
+          executionId,
+        });
+
+        // This is now treated as an error since we expect tagged customers
+        throw new Error(
+          `No customers found with tag '${extractionTag}' - this may indicate tag propagation delay or search index issues`
+        );
+      }
+
+      if (!completedOperation.url) {
+        logger.error("Bulk operation completed but no download URL provided", {
+          operationId: completedOperation.id,
+          status: completedOperation.status,
+          objectCount: completedOperation.objectCount,
+          tag: extractionTag,
+          executionId,
+        });
+
+        throw new Error(
+          "Bulk operation completed but no download URL provided for tag-based extraction"
+        );
+      }
+
+      logger.info("Bulk operation successful, starting blob upload", {
+        operationId: completedOperation.id,
+        objectCount: completedOperation.objectCount,
+        fileSize: completedOperation.fileSize,
+        tag: extractionTag,
+        executionId,
+      });
+
+      const blobResult = await this.downloadBulkDataWithFallback(
+        completedOperation.url,
+        extractionTag,
+        "tag-based",
+        executionId
+      );
+
+      if (!blobResult || !blobResult.success) {
+        throw new Error("Failed to upload extracted data to blob storage");
+      }
+
+      logger.info(
+        "Successfully streamed tagged customer data to Azure Blob Storage",
+        {
+          blobPath: blobResult.blobPath,
+          blobUrl: blobResult.blobUrl,
+          sizeMB: Math.round(blobResult.sizeBytes / (1024 * 1024)),
+          customersFound: completedOperation.objectCount,
+          tag: extractionTag,
+          executionId,
+        }
+      );
+
+      return { blobResult };
+    } catch (error) {
+      logger.error("Tag-based extraction failed", {
+        error: error.message,
+        stack: error.stack,
+        tag: extractionTag,
+        executionId,
+        troubleshooting: {
+          "0_customers_found":
+            "Tag propagation delay - try increasing delay or use full extraction",
+          no_download_url:
+            "Shopify bulk operation issue - retry or use full extraction",
+          bulk_operation_failed: "Query syntax or permission issue",
+        },
+      });
+
+      // Re-throw with more context
+      throw new Error(
+        `Tag-based extraction failed for tag '${extractionTag}': ${error.message}`
+      );
+    }
   }
 
   validateDataConsistency(
@@ -3605,256 +3396,5 @@ async createBulkOperation(query) {
 
     logger.info("Data consistency validation completed", validation);
     return validation;
-  }
-
-  async saveCustomersToAzureBlob(
-    customers,
-    tag,
-    approach = null,
-    additionalInfo = {}
-  ) {
-    logger.info(
-      "Starting Azure Blob Storage STREAM upload process for large dataset"
-    );
-
-    try {
-      // Initialize Azure Blob Service Client
-      const blobServiceClient = BlobServiceClient.fromConnectionString(
-        config.AZURE_STORAGE_CONNECTION_STRING
-      );
-      const containerName = config.BLOB_CONTAINER_NAME;
-      const containerClient =
-        blobServiceClient.getContainerClient(containerName);
-
-      // Extract store name from shopDomain
-      const storeName = this.shopDomain
-        .replace(/\.myshopify\.com$/i, "")
-        .replace(/[^a-z0-9]/gi, "_");
-
-      // Create folder structure: storename/customers/
-      const folderPath = `${storeName}/customers/`;
-
-      // Generate file name: storename_customers_total_count_current_date.jsonl
-      const currentDate = new Date().toISOString().split("T")[0];
-      const totalCount = customers.length;
-      const fileName = `${storeName}_customers_${totalCount}_${currentDate}.jsonl`;
-
-      // Full blob path
-      const blobPath = folderPath + fileName;
-
-      logger.info("Azure Blob Storage configuration for streaming upload", {
-        containerName,
-        storeName,
-        folderPath,
-        fileName,
-        blobPath,
-        totalCount,
-        currentDate,
-        uploadMethod: "streaming_for_large_files",
-      });
-
-      // Check if file already exists
-      const blobClient = containerClient.getBlockBlobClient(blobPath);
-      let existingFileFound = false;
-
-      try {
-        const blobProperties = await blobClient.getProperties();
-        existingFileFound = true;
-
-        logger.info("Existing file found, deleting before stream upload...");
-        await blobClient.delete({ deleteSnapshots: "include" });
-        logger.info("Successfully deleted existing file");
-      } catch (error) {
-        if (error.statusCode === 404) {
-          logger.info("No existing file found - proceeding with stream upload");
-        }
-      }
-
-      // STREAMING UPLOAD: Process customers in chunks to avoid memory issues
-      const chunkSize = 1000; // Process 1000 customers at a time
-      const uploadId = await blobClient.getBlockBlobClient().stage;
-
-      // Use uploadStream for large files instead of upload()
-      const { Readable } = require("stream");
-
-      logger.info("Starting streaming upload process", {
-        totalCustomers: customers.length,
-        chunkSize,
-        estimatedChunks: Math.ceil(customers.length / chunkSize),
-      });
-
-      // Create a readable stream from customer data
-      let customerIndex = 0;
-      const customerStream = new Readable({
-        read() {
-          if (customerIndex >= customers.length) {
-            this.push(null); // End of stream
-            return;
-          }
-
-          // Process chunk of customers
-          const chunk = customers.slice(
-            customerIndex,
-            customerIndex + chunkSize
-          );
-          customerIndex += chunkSize;
-
-          // Transform chunk to JSONL
-          const jsonlChunk =
-            chunk
-              .map((customer) => {
-                const cleanCustomer = {
-                  ...customer,
-                  _extractedAt: new Date().toISOString(),
-                  _extractionTag: tag || "extracted-bulk",
-                  _extractionApproach: approach || "unknown",
-                  _storeName: storeName,
-                  _totalCount: totalCount,
-                  _replacedExisting: existingFileFound,
-                };
-
-                if (
-                  approach === "date-based" &&
-                  additionalInfo.startDate &&
-                  additionalInfo.endDate
-                ) {
-                  cleanCustomer._dateFilter = {
-                    startDate: additionalInfo.startDate,
-                    endDate: additionalInfo.endDate,
-                  };
-                }
-
-                return JSON.stringify(cleanCustomer);
-              })
-              .join("\n") + (customerIndex < customers.length ? "\n" : "");
-
-          this.push(jsonlChunk);
-
-          // Log progress
-          if (
-            customerIndex % 10000 === 0 ||
-            customerIndex >= customers.length
-          ) {
-            logger.info("Streaming upload progress", {
-              processed: Math.min(customerIndex, customers.length),
-              total: customers.length,
-              progress:
-                (
-                  (Math.min(customerIndex, customers.length) /
-                    customers.length) *
-                  100
-                ).toFixed(1) + "%",
-            });
-          }
-        },
-      });
-
-      // Set blob metadata and properties
-      const metadata = {
-        storeName: storeName,
-        approach: approach || "unknown",
-        extractionTag: tag || "extracted-bulk",
-        totalCount: totalCount.toString(),
-        extractedAt: new Date().toISOString(),
-        fileType: "shopify-customers",
-        replacedExisting: existingFileFound.toString(),
-        uploadVersion: "1.0",
-        uploadMethod: "streaming",
-      };
-
-      if (
-        approach === "date-based" &&
-        additionalInfo.startDate &&
-        additionalInfo.endDate
-      ) {
-        metadata.startDate = additionalInfo.startDate;
-        metadata.endDate = additionalInfo.endDate;
-        metadata.dateFiltered = "true";
-      }
-
-      const uploadOptions = {
-        metadata,
-        blobHTTPHeaders: {
-          blobContentType: "application/x-jsonlines",
-        },
-        maxSingleShotSize: 4 * 1024 * 1024, // 4MB chunks
-        bufferSize: 8 * 1024 * 1024, // 8MB buffer
-        maxBuffers: 5, // Max 5 buffers in memory
-      };
-
-      // Upload using stream - this is much faster for large files
-      logger.info("Starting streaming upload to Azure Blob Storage...");
-      const uploadStartTime = Date.now();
-
-      const uploadResponse = await blobClient.uploadStream(
-        customerStream,
-        uploadOptions.bufferSize,
-        uploadOptions.maxBuffers,
-        {
-          metadata: uploadOptions.metadata,
-          blobHTTPHeaders: uploadOptions.blobHTTPHeaders,
-        }
-      );
-
-      const uploadDuration = Date.now() - uploadStartTime;
-      const blobUrl = blobClient.url;
-
-      logger.info(
-        "Successfully uploaded to Azure Blob Storage using streaming",
-        {
-          blobPath,
-          blobUrl,
-          requestId: uploadResponse.requestId,
-          etag: uploadResponse.etag,
-          lastModified: uploadResponse.lastModified,
-          recordCount: customers.length,
-          uploadDurationMs: uploadDuration,
-          uploadDurationMinutes:
-            Math.round((uploadDuration / 60000) * 100) / 100,
-          containerName,
-          fileName,
-          replacedExisting: existingFileFound,
-          operation: existingFileFound ? "replaced" : "created",
-          uploadMethod: "streaming",
-          avgCustomersPerSecond: Math.round(
-            customers.length / (uploadDuration / 1000)
-          ),
-        }
-      );
-
-      return {
-        success: true,
-        blobPath,
-        blobUrl,
-        fileName,
-        folderPath,
-        storeName,
-        containerName,
-        sizeBytes: "calculated_during_stream",
-        count: customers.length,
-        approach: approach || "unknown",
-        replacedExisting: existingFileFound,
-        operation: existingFileFound ? "replaced" : "created",
-        uploadDurationMs: uploadDuration,
-        uploadMethod: "streaming",
-        uploadResponse: {
-          requestId: uploadResponse.requestId,
-          etag: uploadResponse.etag,
-          lastModified: uploadResponse.lastModified,
-        },
-        metadata,
-      };
-    } catch (error) {
-      logger.error("Failed to upload to Azure Blob Storage using streaming", {
-        error: error.message,
-        stack: error.stack,
-        containerName: config.BLOB_CONTAINER_NAME,
-        storeName: this.shopDomain,
-      });
-
-      throw new Error(
-        "Failed to upload customer data to Azure Blob Storage: " + error.message
-      );
-    }
   }
 }
