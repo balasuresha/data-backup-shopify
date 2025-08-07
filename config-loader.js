@@ -22,31 +22,38 @@ async function loadConfig() {
       console.log("Running locally - loading from local.settings.json");
       config = await loadLocalConfig();
     } else {
-      console.log("Running in Azure - loading from Key Vault");
+      console.log("Running in Azure - loading from Key Vault with fallback to environment variables");
       config = await loadFromKeyVault();
     }
 
-    // Validate required configuration
+    // Validate required configuration for both Shopify and Table functions
     const requiredVars = [
       "SHOPIFY_STORE_URL", 
       "SHOPIFY_ACCESS_TOKEN",
       "AZURE_STORAGE_CONNECTION_STRING",
-      "BLOB_CONTAINER_NAME"
+      "BLOB_CONTAINER_NAME",
+      // Table-specific configuration
+      "STORE_EXTRACTION_LOG_TABLE",
+      "STORE_EXTRACTION_DETAILS_TABLE"
     ];
     
     const missingVars = requiredVars.filter((varName) => !config[varName]);
 
     if (missingVars.length > 0) {
-      throw new Error(
-        "Missing required configuration values: " + missingVars.join(", ") + 
-        "\nEnvironment: " + (isLocalhost ? "localhost" : "Azure")
+      console.warn(
+        "Some configuration values are missing: " + missingVars.join(", ") + 
+        "\nEnvironment: " + (isLocalhost ? "localhost" : "Azure") +
+        "\nThis may be expected if not all functions are being used."
       );
+      // Don't throw error - some functions may not need all config
     }
 
     console.log("Configuration loaded successfully", {
       environment: isLocalhost ? "localhost" : "Azure",
-      configuredKeys: Object.keys(config).filter(key => !key.includes('SECRET') && !key.includes('TOKEN')),
-      requiredVarsPresent: requiredVars.every(varName => config[varName])
+      configuredKeys: Object.keys(config).filter(key => !key.includes('SECRET') && !key.includes('TOKEN') && !key.includes('KEY')),
+      hasTableConfig: !!(config.STORE_EXTRACTION_LOG_TABLE && config.STORE_EXTRACTION_DETAILS_TABLE),
+      hasShopifyConfig: !!(config.SHOPIFY_STORE_URL && config.SHOPIFY_ACCESS_TOKEN),
+      hasStorageConfig: !!config.AZURE_STORAGE_CONNECTION_STRING
     });
 
     return config;
@@ -101,7 +108,7 @@ async function loadLocalConfig() {
   return config;
 }
 
-// Load configuration from Azure Key Vault for production
+// Load configuration from Azure Key Vault for production with fallback
 async function loadFromKeyVault() {
   const config = {};
   
@@ -110,29 +117,39 @@ async function loadFromKeyVault() {
     const keyVaultUrl = process.env.AZURE_KEY_VAULT_URL;
     
     if (!keyVaultUrl) {
-      throw new Error("AZURE_KEY_VAULT_URL environment variable is required when running in Azure");
+      console.warn("AZURE_KEY_VAULT_URL not found, falling back to environment variables");
+      return loadFromEnvironmentVariables();
     }
 
     console.log("Connecting to Azure Key Vault:", keyVaultUrl);
 
     // Use DefaultAzureCredential which tries multiple authentication methods
-    // In Azure Functions, this will use Managed Identity
     const credential = new DefaultAzureCredential();
     const client = new SecretClient(keyVaultUrl, credential);
 
-    // Define the secrets to retrieve from Key Vault
-    // Key Vault secret names should use hyphens instead of underscores
+    // Enhanced secret mappings to include table configuration
     const secretMappings = {
+      // Shopify configuration
       "shopify-store-url": "SHOPIFY_STORE_URL",
       "shopify-access-token": "SHOPIFY_ACCESS_TOKEN", 
       "shopify-api-version": "SHOPIFY_API_VERSION",
+      
+      // Azure Storage configuration
       "azure-storage-connection-string": "AZURE_STORAGE_CONNECTION_STRING",
+      "azure-storage-account-name": "AZURE_STORAGE_ACCOUNT_NAME",
+      "azure-storage-account-key": "AZURE_STORAGE_ACCOUNT_KEY",
+      
+      // Application configuration
       "blob-container-name": "BLOB_CONTAINER_NAME",
       "extraction-tag": "EXTRACTION_TAG",
       "max-retry-attempts": "MAX_RETRY_ATTEMPTS",
       "retry-delay-ms": "RETRY_DELAY_MS",
       "max-concurrent-batches": "MAX_CONCURRENT_BATCHES",
-      "log-level": "LOG_LEVEL"
+      "log-level": "LOG_LEVEL",
+      
+      // Table-specific configuration
+      "store-extraction-log-table": "STORE_EXTRACTION_LOG_TABLE",
+      "store-extraction-details-table": "STORE_EXTRACTION_DETAILS_TABLE"
     };
 
     console.log("Retrieving secrets from Key Vault...");
@@ -175,10 +192,23 @@ async function loadFromKeyVault() {
       failedKeys: failed.map(r => ({ key: r.key, reason: r.reason }))
     });
 
+    // Fallback to environment variables for missing secrets
+    const missingKeys = failed.map(r => r.key);
+    if (missingKeys.length > 0) {
+      console.log("Attempting to load missing configuration from environment variables:", missingKeys);
+      
+      missingKeys.forEach(key => {
+        if (process.env[key] !== undefined && process.env[key] !== "") {
+          config[key] = process.env[key];
+          console.log(`Using environment variable fallback for: ${key}`);
+        }
+      });
+    }
+
     // Also check for any environment variables that might override Key Vault values
-    // This allows for runtime overrides in Azure if needed
-    const envOverrides = Object.values(secretMappings).filter(key => 
-      process.env[key] !== undefined && process.env[key] !== ""
+    const allConfigKeys = Object.values(secretMappings);
+    const envOverrides = allConfigKeys.filter(key => 
+      process.env[key] !== undefined && process.env[key] !== "" && config[key] !== process.env[key]
     );
 
     if (envOverrides.length > 0) {
@@ -194,38 +224,57 @@ async function loadFromKeyVault() {
   } catch (error) {
     console.error("Failed to load configuration from Key Vault:", error.message);
     
-    // If Key Vault fails, try to fall back to environment variables
-    console.log("Attempting fallback to environment variables...");
-    
-    const fallbackConfig = {};
-    const requiredKeys = [
-      "SHOPIFY_STORE_URL", 
-      "SHOPIFY_ACCESS_TOKEN",
-      "AZURE_STORAGE_CONNECTION_STRING",
-      "BLOB_CONTAINER_NAME",
-      "SHOPIFY_API_VERSION",
-      "EXTRACTION_TAG",
-      "MAX_RETRY_ATTEMPTS", 
-      "RETRY_DELAY_MS",
-      "MAX_CONCURRENT_BATCHES",
-      "LOG_LEVEL"
-    ];
-
-    let fallbackSuccess = false;
-    requiredKeys.forEach(key => {
-      if (process.env[key]) {
-        fallbackConfig[key] = process.env[key];
-        fallbackSuccess = true;
-      }
-    });
-
-    if (fallbackSuccess) {
-      console.log("Fallback to environment variables successful");
-      return fallbackConfig;
-    } else {
-      throw new Error(`Key Vault failed and no environment variable fallback available: ${error.message}`);
-    }
+    // If Key Vault fails completely, fall back to environment variables
+    console.log("Attempting complete fallback to environment variables...");
+    return loadFromEnvironmentVariables();
   }
+}
+
+// Fallback function to load from environment variables only
+function loadFromEnvironmentVariables() {
+  console.log("Loading configuration from environment variables...");
+  
+  const config = {};
+  const configKeys = [
+    // Shopify configuration
+    "SHOPIFY_STORE_URL", 
+    "SHOPIFY_ACCESS_TOKEN",
+    "SHOPIFY_API_VERSION",
+    
+    // Azure Storage configuration
+    "AZURE_STORAGE_CONNECTION_STRING",
+    "AZURE_STORAGE_ACCOUNT_NAME",
+    "AZURE_STORAGE_ACCOUNT_KEY",
+    
+    // Application configuration
+    "BLOB_CONTAINER_NAME",
+    "EXTRACTION_TAG",
+    "MAX_RETRY_ATTEMPTS", 
+    "RETRY_DELAY_MS",
+    "MAX_CONCURRENT_BATCHES",
+    "LOG_LEVEL",
+    
+    // Table-specific configuration
+    "STORE_EXTRACTION_LOG_TABLE",
+    "STORE_EXTRACTION_DETAILS_TABLE"
+  ];
+
+  let loadedCount = 0;
+  configKeys.forEach(key => {
+    if (process.env[key] !== undefined && process.env[key] !== "") {
+      config[key] = process.env[key];
+      console.log(`Loaded from environment: ${key}`);
+      loadedCount++;
+    }
+  });
+
+  console.log(`Environment variable fallback completed: ${loadedCount}/${configKeys.length} variables loaded`);
+  
+  if (loadedCount === 0) {
+    throw new Error("No configuration found in environment variables");
+  }
+  
+  return config;
 }
 
 // Helper function to set up Key Vault secrets (for initial setup)
@@ -237,16 +286,27 @@ async function setupKeyVaultSecrets(keyVaultUrl, secretValues) {
     const client = new SecretClient(keyVaultUrl, credential);
 
     const secretMappings = {
+      // Shopify configuration
       "shopify-store-url": "SHOPIFY_STORE_URL",
       "shopify-access-token": "SHOPIFY_ACCESS_TOKEN",
       "shopify-api-version": "SHOPIFY_API_VERSION", 
+      
+      // Azure Storage configuration
       "azure-storage-connection-string": "AZURE_STORAGE_CONNECTION_STRING",
+      "azure-storage-account-name": "AZURE_STORAGE_ACCOUNT_NAME",
+      "azure-storage-account-key": "AZURE_STORAGE_ACCOUNT_KEY",
+      
+      // Application configuration
       "blob-container-name": "BLOB_CONTAINER_NAME",
       "extraction-tag": "EXTRACTION_TAG",
       "max-retry-attempts": "MAX_RETRY_ATTEMPTS",
       "retry-delay-ms": "RETRY_DELAY_MS", 
       "max-concurrent-batches": "MAX_CONCURRENT_BATCHES",
-      "log-level": "LOG_LEVEL"
+      "log-level": "LOG_LEVEL",
+      
+      // Table-specific configuration
+      "store-extraction-log-table": "STORE_EXTRACTION_LOG_TABLE",
+      "store-extraction-details-table": "STORE_EXTRACTION_DETAILS_TABLE"
     };
 
     for (const [secretName, configKey] of Object.entries(secretMappings)) {
@@ -272,5 +332,6 @@ module.exports = {
   loadConfig, 
   loadLocalConfig, 
   loadFromKeyVault, 
+  loadFromEnvironmentVariables,
   setupKeyVaultSecrets 
 };

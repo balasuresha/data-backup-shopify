@@ -3,8 +3,6 @@ const winston = require("winston");
 const { v4: uuidv4 } = require("uuid");
 const { createAzureFunctionLogger } = require("../../logging");
 const { TableClient, AzureNamedKeyCredential } = require('@azure/data-tables');
-const { SecretClient } = require("@azure/keyvault-secrets");
-const { DefaultAzureCredential } = require("@azure/identity");
 
 const { loadConfig } = require("../../config-loader");
 
@@ -17,8 +15,8 @@ let isConfigurationLoaded = false;
 let STORAGE_ACCOUNT_NAME = null;
 let STORAGE_ACCOUNT_KEY = null;
 let AZURE_STORAGE_CONNECTION_STRING = null;
-let SOURCE_TABLE_NAME = null;
-let TARGET_TABLE_NAME = null;
+let STORE_EXTRACTION_LOG_TABLE = null; // source table for extraction logs
+let STORE_EXTRACTION_DETAILS_TABLE = null; // table for extraction date by store
 
 // Table clients
 let sourceTableClient = null;
@@ -62,39 +60,20 @@ function validateAndSanitizeInput(requestBody) {
     const sanitized = {};
     
     // Validate storeName
-    if (requestBody.storeName !== undefined) {
-        if (typeof requestBody.storeName !== 'string') {
-            errors.push('storeName must be a string');
-        } else if (requestBody.storeName.length === 0) {
-            errors.push('storeName cannot be empty');
-        } else if (requestBody.storeName.length > 100) {
-            errors.push('storeName cannot exceed 100 characters');
+    if (requestBody.initiateDateExtraction !== undefined) {
+        if (typeof requestBody.initiateDateExtraction !== 'boolean') {
+            if (requestBody.initiateDateExtraction === 'true' || requestBody.initiateDateExtraction === true) {
+                sanitized.initiateDateExtraction = true;
+            } else if (requestBody.initiateDateExtraction === 'false' || requestBody.initiateDateExtraction === false) {
+                sanitized.initiateDateExtraction = false;
+            } else {
+                errors.push('initiateDateExtraction must be a boolean (true/false)');
+            }
         } else {
-            // Sanitize for Azure Table Storage filter queries
-            sanitized.storeName = requestBody.storeName.replace(/'/g, "''"); // Escape single quotes
-        }
-    }
-    
-    // Validate frequency if provided
-    if (requestBody.frequency !== undefined) {
-        if (typeof requestBody.frequency !== 'string') {
-            errors.push('frequency must be a string');
-        } else if (!VALID_FREQUENCIES.includes(requestBody.frequency.toLowerCase())) {
-            errors.push(`frequency must be one of: ${VALID_FREQUENCIES.join(', ')}`);
-        } else {
-            sanitized.frequency = requestBody.frequency.toLowerCase();
-        }
-    }
-    
-    // Validate validateData
-    if (requestBody.validateData !== undefined) {
-        if (typeof requestBody.validateData !== 'boolean') {
-            sanitized.validateData = requestBody.validateData === 'true';
-        } else {
-            sanitized.validateData = requestBody.validateData;
+            sanitized.initiateDateExtraction = requestBody.initiateDateExtraction;
         }
     } else {
-        sanitized.validateData = true;
+        errors.push('initiateDateExtraction parameter is required and must be set to true to proceed with extraction');
     }
     
     // Validate health check
@@ -107,135 +86,100 @@ function validateAndSanitizeInput(requestBody) {
 
 // Enhanced configuration loader with better error handling
 async function loadConfigurationValues() {
-    const keyVaultUrl = process.env.AZURE_KEY_VAULT_URL;
-    const configSources = [];
+    console.log("Loading configuration values...");
     
     try {
-        if (keyVaultUrl) {
-            console.log("Loading configuration from Azure Key Vault:", keyVaultUrl);
-            
-            const credential = new DefaultAzureCredential();
-            const client = new SecretClient(keyVaultUrl, credential);
-            
-            // Load secrets with individual error handling
-            const secretNames = [
-                "AZURE-STORAGE-ACCOUNT-NAME",
-                "AZURE-STORAGE-ACCOUNT-KEY", 
-                "AZURE-STORAGE-CONNECTION-STRING",
-                "SOURCE-TABLE-NAME",
-                "TARGET-TABLE-NAME"
-            ];
-            
-            const secretResults = await Promise.allSettled(
-                secretNames.map(name => 
-                    retryOperation(() => client.getSecret(name))
-                )
-            );
-            
-            // Process results with detailed logging
-            const secretValues = {};
-            secretResults.forEach((result, index) => {
-                const secretName = secretNames[index];
-                if (result.status === 'fulfilled') {
-                    secretValues[secretName] = result.value.value;
-                    configSources.push(`KeyVault:${secretName}`);
-                } else {
-                    console.warn(`Failed to load secret ${secretName}:`, result.reason.message);
-                }
-            });
-            
-            // Map to variables
-            STORAGE_ACCOUNT_NAME = secretValues["AZURE-STORAGE-ACCOUNT-NAME"];
-            STORAGE_ACCOUNT_KEY = secretValues["AZURE-STORAGE-ACCOUNT-KEY"];
-            AZURE_STORAGE_CONNECTION_STRING = secretValues["AZURE-STORAGE-CONNECTION-STRING"];
-            SOURCE_TABLE_NAME = secretValues["SOURCE-TABLE-NAME"];
-            TARGET_TABLE_NAME = secretValues["TARGET-TABLE-NAME"];
-            
-        } else {
-            console.log("No Key Vault URL found, skipping Key Vault loading");
+        // Use the existing config loader which handles both Key Vault and local.settings.json
+        const loadedConfig = await loadConfig();
+        
+        // Map the loaded configuration to the variables we need
+        STORAGE_ACCOUNT_NAME = loadedConfig.AZURE_STORAGE_ACCOUNT_NAME;
+        STORAGE_ACCOUNT_KEY = loadedConfig.AZURE_STORAGE_ACCOUNT_KEY;
+        AZURE_STORAGE_CONNECTION_STRING = loadedConfig.AZURE_STORAGE_CONNECTION_STRING;
+        STORE_EXTRACTION_LOG_TABLE = loadedConfig.STORE_EXTRACTION_LOG_TABLE;
+        STORE_EXTRACTION_DETAILS_TABLE = loadedConfig.STORE_EXTRACTION_DETAILS_TABLE;
+        
+        console.log("Configuration mapping completed:", {
+            hasStorageAccountName: !!STORAGE_ACCOUNT_NAME,
+            hasStorageAccountKey: !!STORAGE_ACCOUNT_KEY,
+            hasConnectionString: !!AZURE_STORAGE_CONNECTION_STRING,
+            sourceTableName: STORE_EXTRACTION_LOG_TABLE,
+            targetTableName: STORE_EXTRACTION_DETAILS_TABLE
+        });
+        
+        // Validate required configuration
+        const missingConfig = [];
+        
+        // Check Azure Storage credentials
+        if (!AZURE_STORAGE_CONNECTION_STRING && (!STORAGE_ACCOUNT_NAME || !STORAGE_ACCOUNT_KEY)) {
+            missingConfig.push('Azure Storage credentials (connection string or account name/key)');
         }
-    } catch (keyVaultError) {
-        console.warn("Key Vault loading failed, using fallback:", keyVaultError.message);
+        
+        // Check table names
+        if (!STORE_EXTRACTION_LOG_TABLE) {
+            missingConfig.push('STORE_EXTRACTION_LOG_TABLE');
+        }
+        if (!STORE_EXTRACTION_DETAILS_TABLE) {
+            missingConfig.push('STORE_EXTRACTION_DETAILS_TABLE');
+        }
+        
+        if (missingConfig.length > 0) {
+            throw new Error(`Missing required configuration: ${missingConfig.join(', ')}`);
+        }
+        
+        // Validate connection string format if provided
+        if (AZURE_STORAGE_CONNECTION_STRING && !validateConnectionString(AZURE_STORAGE_CONNECTION_STRING)) {
+            throw new Error('Azure Storage connection string format is invalid');
+        }
+        
+        console.log("Configuration validation successful");
+        isConfigurationLoaded = true;
+        
+    } catch (error) {
+        console.error("Configuration loading failed:", error.message);
+        throw new Error(`Configuration loading failed: ${error.message}`);
+    }
+}
+
+function validateConnectionString(connectionString) {
+    if (!connectionString || typeof connectionString !== 'string') {
+        return false;
     }
     
-    // Fallback to environment variables with validation
-    const envMappings = [
-        { env: 'AZURE_STORAGE_ACCOUNT_NAME', variable: 'STORAGE_ACCOUNT_NAME', current: STORAGE_ACCOUNT_NAME },
-        { env: 'AZURE_STORAGE_ACCOUNT_KEY', variable: 'STORAGE_ACCOUNT_KEY', current: STORAGE_ACCOUNT_KEY },
-        { env: 'AZURE_STORAGE_CONNECTION_STRING', variable: 'AZURE_STORAGE_CONNECTION_STRING', current: AZURE_STORAGE_CONNECTION_STRING },
-        { env: 'SOURCE_TABLE_NAME', variable: 'SOURCE_TABLE_NAME', current: SOURCE_TABLE_NAME },
-        { env: 'TARGET_TABLE_NAME', variable: 'TARGET_TABLE_NAME', current: TARGET_TABLE_NAME }
+    // Check for required components
+    const requiredComponents = [
+        'DefaultEndpointsProtocol=',
+        'AccountName=',
+        'AccountKey=',
+        'EndpointSuffix='
     ];
     
-    envMappings.forEach(mapping => {
-        if (!mapping.current && process.env[mapping.env]) {
-            switch (mapping.variable) {
-                case 'STORAGE_ACCOUNT_NAME':
-                    STORAGE_ACCOUNT_NAME = process.env[mapping.env];
-                    break;
-                case 'STORAGE_ACCOUNT_KEY':
-                    STORAGE_ACCOUNT_KEY = process.env[mapping.env];
-                    break;
-                case 'AZURE_STORAGE_CONNECTION_STRING':
-                    AZURE_STORAGE_CONNECTION_STRING = process.env[mapping.env];
-                    break;
-                case 'SOURCE_TABLE_NAME':
-                    SOURCE_TABLE_NAME = process.env[mapping.env];
-                    break;
-                case 'TARGET_TABLE_NAME':
-                    TARGET_TABLE_NAME = process.env[mapping.env];
-                    break;
-            }
-            configSources.push(`Env:${mapping.env}`);
-        }
-    });
+    const hasAllComponents = requiredComponents.every(component => 
+        connectionString.includes(component)
+    );
     
-    // Apply defaults for table names if not set
-    if (!SOURCE_TABLE_NAME) {
-        SOURCE_TABLE_NAME = 'StoreExtractionLog';
-        configSources.push('Default:SOURCE_TABLE_NAME');
-    }
-    if (!TARGET_TABLE_NAME) {
-        TARGET_TABLE_NAME = 'ExtractionDateByStore';
-        configSources.push('Default:TARGET_TABLE_NAME');
+    if (!hasAllComponents) {
+        console.error('Connection string missing required components:', {
+            connectionStringPrefix: connectionString.substring(0, 50) + '...',
+            missingComponents: requiredComponents.filter(comp => !connectionString.includes(comp))
+        });
+        return false;
     }
     
-    // Validate required configuration
-    const missingConfig = [];
-    if (!AZURE_STORAGE_CONNECTION_STRING && (!STORAGE_ACCOUNT_NAME || !STORAGE_ACCOUNT_KEY)) {
-        missingConfig.push('Azure Storage credentials (connection string or account name/key)');
-    }
-    if (!SOURCE_TABLE_NAME) missingConfig.push('SOURCE_TABLE_NAME');
-    if (!TARGET_TABLE_NAME) missingConfig.push('TARGET_TABLE_NAME');
-    
-    if (missingConfig.length > 0) {
-        throw new Error(`Missing required configuration: ${missingConfig.join(', ')}`);
-    }
-    
-    console.log("Configuration loaded successfully:", {
-        sources: configSources,
-        hasStorageAccountName: !!STORAGE_ACCOUNT_NAME,
-        hasStorageAccountKey: !!STORAGE_ACCOUNT_KEY,
-        hasConnectionString: !!AZURE_STORAGE_CONNECTION_STRING,
-        sourceTableName: SOURCE_TABLE_NAME,
-        targetTableName: TARGET_TABLE_NAME
-    });
-    
-    isConfigurationLoaded = true;
+    return true;
 }
 
 async function initializeConfiguration() {
-    if (!config) {
+    if (!config || !isConfigurationLoaded) {
         try {
             console.log("Initializing configuration...");
             
-            // Load configuration values first
-            if (!isConfigurationLoaded) {
-                await loadConfigurationValues();
-            }
+            // Load configuration values (this also loads the main config)
+            await loadConfigurationValues();
             
-            // Then load the main config
+            // Set the config object (it's used by the logger)
             config = await loadConfig();
+            
             console.log("Configuration initialized successfully");
         } catch (error) {
             console.error("Failed to initialize configuration:", error.message);
@@ -250,42 +194,72 @@ function initializeTableClients() {
         throw new Error('Configuration must be loaded before initializing table clients');
     }
     
-    // Method 1: Try connection string first (recommended)
+    console.log('=== INITIALIZING TABLE CLIENTS (FIXED VERSION) ===');
+    
+    // Validate table names
+    if (!STORE_EXTRACTION_LOG_TABLE || !STORE_EXTRACTION_DETAILS_TABLE) {
+        throw new Error('Table names are not configured properly');
+    }
+    
+    console.log('Table names validated:', {
+        sourceTable: STORE_EXTRACTION_LOG_TABLE,
+        targetTable: STORE_EXTRACTION_DETAILS_TABLE
+    });
+
     if (AZURE_STORAGE_CONNECTION_STRING) {
         try {
-            sourceTableClient = new TableClient(AZURE_STORAGE_CONNECTION_STRING, SOURCE_TABLE_NAME);
-            targetTableClient = new TableClient(AZURE_STORAGE_CONNECTION_STRING, TARGET_TABLE_NAME);
-            console.log('Table clients initialized with connection string');
+            console.log('Parsing connection string manually...');
+            
+            // Parse connection string into components
+            const connectionParams = {};
+            const parts = AZURE_STORAGE_CONNECTION_STRING.split(';');
+            
+            parts.forEach(part => {
+                if (part.includes('=')) {
+                    const [key, ...valueParts] = part.split('=');
+                    connectionParams[key.trim()] = valueParts.join('=').trim();
+                }
+            });
+            
+            console.log('Connection string parsed:', {
+                hasProtocol: !!connectionParams.DefaultEndpointsProtocol,
+                hasAccountName: !!connectionParams.AccountName,
+                hasAccountKey: !!connectionParams.AccountKey,
+                hasEndpointSuffix: !!connectionParams.EndpointSuffix,
+                accountName: connectionParams.AccountName
+            });
+            
+            // Extract required values
+            const accountName = connectionParams.AccountName;
+            const accountKey = connectionParams.AccountKey;
+            const endpointSuffix = connectionParams.EndpointSuffix || 'core.windows.net';
+            
+            if (!accountName || !accountKey) {
+                throw new Error('Missing AccountName or AccountKey in connection string');
+            }
+            
+            // Create credential and service URL
+            const credential = new AzureNamedKeyCredential(accountName, accountKey);
+            const serviceUrl = `https://${accountName}.table.${endpointSuffix}`;
+            
+            console.log('Creating table clients with explicit credentials:', {
+                serviceUrl: serviceUrl,
+                accountName: accountName,
+                sourceTable: STORE_EXTRACTION_LOG_TABLE,
+                targetTable: STORE_EXTRACTION_DETAILS_TABLE
+            });
+            
+            // Create table clients using explicit credentials (this works!)
+            sourceTableClient = new TableClient(serviceUrl, STORE_EXTRACTION_LOG_TABLE, credential);
+            targetTableClient = new TableClient(serviceUrl, STORE_EXTRACTION_DETAILS_TABLE, credential);
+            
+            console.log('Table clients created successfully using parsed connection string');
             return;
-        } catch (error) {
-            console.error('Failed to initialize with connection string:', error.message);
-            throw new Error(`Table client initialization failed with connection string: ${error.message}`);
+            
+        } catch (parseError) {
+            console.error('Failed to parse connection string:', parseError.message);
+            throw new Error(`Connection string parsing failed: ${parseError.message}`);
         }
-    }
-    
-    // Method 2: Use account name and key
-    if (!STORAGE_ACCOUNT_NAME || !STORAGE_ACCOUNT_KEY) {
-        throw new Error('Azure Storage credentials not configured. Please set either AZURE_STORAGE_CONNECTION_STRING or both AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY in Key Vault or application settings.');
-    }
-    
-    // Validate storage account name format
-    if (!/^[a-z0-9]{3,24}$/.test(STORAGE_ACCOUNT_NAME)) {
-        throw new Error(`Invalid storage account name format: "${STORAGE_ACCOUNT_NAME}". Must be 3-24 characters, lowercase letters and numbers only.`);
-    }
-    
-    try {
-        const credential = new AzureNamedKeyCredential(STORAGE_ACCOUNT_NAME, STORAGE_ACCOUNT_KEY);
-        const serviceUrl = `https://${STORAGE_ACCOUNT_NAME}.table.core.windows.net`;
-        
-        console.log(`Connecting to: ${serviceUrl}`);
-        
-        sourceTableClient = new TableClient(serviceUrl, SOURCE_TABLE_NAME, credential);
-        targetTableClient = new TableClient(serviceUrl, TARGET_TABLE_NAME, credential);
-        
-        console.log('Table clients initialized with account name and key');
-        
-    } catch (error) {
-        throw new Error(`Failed to initialize table clients with credentials: ${error.message}`);
     }
 }
 
@@ -421,14 +395,26 @@ function extractEntityFields(entity) {
     const extractionEndDate = entity.extractionEndDate || entity.ExtractionEndDate || entity.extraction_end_date || entity.Extraction_End_Date;
     const frequency = (entity.frequency || entity.Frequency || entity.extraction_frequency || 'monthly').toLowerCase();
     const rowKey = entity.rowKey || entity.RowKey || entity.row_key || 'unknown';
+    const status = getEntityStatus(entity);
     
     return {
         storeName,
         extractionStartDate,
         extractionEndDate,
         frequency,
-        rowKey
+        rowKey,
+        status
     };
+}
+
+function getEntityStatus(entity) {
+    return entity.status || 
+           entity.Status || 
+           entity.extraction_status || 
+           entity.Extraction_Status || 
+           entity.extractionStatus || 
+           entity.ExtractionStatus || 
+           null;
 }
 
 // Process entities in batches to avoid memory issues
@@ -478,6 +464,14 @@ async function processEntity(entity, entityIndex, startTime) {
     
     try {
         const fields = extractEntityFields(entity);
+
+        if (fields.status && fields.status.toLowerCase() === 'completed') {
+            logger.warn(`Skipping completed entity that passed filter: ${fields.rowKey}`, {
+                storeName: fields.storeName,
+                status: fields.status
+            });
+            return { success: results, errors };
+        }
         
         if (!fields.storeName || !fields.extractionStartDate || !fields.extractionEndDate) {
             errors.push({
@@ -493,7 +487,7 @@ async function processEntity(entity, entityIndex, startTime) {
             return { success: results, errors };
         }
         
-        logger.info(`Processing: ${fields.storeName} (${fields.extractionStartDate} to ${fields.extractionEndDate}) with frequency: ${fields.frequency}`);
+        logger.info(`Processing: ${fields.storeName} (${fields.extractionStartDate} to ${fields.extractionEndDate}) with frequency: ${fields.frequency}, status: ${fields.status || 'unknown'}`);
         
         // Split date range based on frequency
         const dateRanges = splitDateRangeByFrequency(
@@ -759,14 +753,27 @@ async function getExtractionDateByStore(request, context) {
 
         // Set up filter for specific store processing
         let filter = null;
+        const statusFilter = "(status ne 'Completed' and status ne 'completed') or (Status ne 'Completed' and Status ne 'completed')";
         if (specificStore) {
-            logger.info(`Processing specific store: ${specificStore}`);
+            logger.info(`Processing specific store: ${specificStore} (excluding completed records)`);
             // Use the sanitized store name for the filter
-            filter = `storeName eq '${specificStore}' or StoreName eq '${specificStore}'`;
+            const storeFilter = `storeName eq '${specificStore}' or StoreName eq '${specificStore}'`;
+            filter = `(${storeFilter}) and (${statusFilter})`;
+        } else {
+            // Just filter by status when no specific store
+            filter = statusFilter;
         }
-        
+
+        logger.info('Applied filter to exclude completed records', { 
+            filter: filter,
+            specificStore: specificStore || 'all stores'
+        });
+
         // Read entities from source table with streaming to handle large datasets
-        logger.info('Reading from StoreExtractionLog table...');
+         logger.info('Reading from StoreExtractionLog table (excluding completed records)...', {
+            filter: filter,
+            excludingCompleted: true
+        });
         const sourceEntities = [];
         
         const listOptions = filter ? { queryOptions: { filter } } : {};
@@ -787,8 +794,8 @@ async function getExtractionDateByStore(request, context) {
         
         if (sourceEntities.length === 0) {
             const message = specificStore ? 
-                `No records found for store: ${specificStore}` : 
-                'No records found in StoreExtractionLog table';
+                `No non-completed records found for store: ${specificStore}` : 
+                'No non-completed records found in StoreExtractionLog table';
             
             response = {
                 status: 200,
@@ -797,6 +804,8 @@ async function getExtractionDateByStore(request, context) {
                     success: true,
                     message: message,
                     processedCount: 0,
+                    excludedCompleted: true,
+                    filter: filter,
                     processingTime: `${Date.now() - startTime.getTime()}ms`,
                     results: [],
                     errors: [],
@@ -806,7 +815,11 @@ async function getExtractionDateByStore(request, context) {
             return response;
         }
         
-        logger.info(`Found ${sourceEntities.length} records to process`);
+        logger.info(`Found ${sourceEntities.length} non-completed records to process`, {
+            totalFound: sourceEntities.length,
+            excludedCompleted: true,
+            filter: filter
+        });
 
         const results = {
             executionId,
