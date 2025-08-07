@@ -369,7 +369,9 @@ class ShopifyBulkService {
             try {
                 this.logger.info(`Attempting to store file in blob storage: ${filename}`);
                 await this.ensureContainerExists();
-                const blobPath = `${this.storeName}/products/${filename}`;
+
+                const storeName = this.shopDomain.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
+                const blobPath = `${storeName}/products/${filename}`;
                 const blockBlobClient = this.containerClient.getBlockBlobClient(blobPath);
                 const uploadOptions = {
                     blobHTTPHeaders: {
