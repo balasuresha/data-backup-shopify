@@ -285,7 +285,6 @@ function parseAndValidateDate(dateString, fieldName) {
     return date;
 }
 
-// Enhanced date range splitting with better error handling
 function splitDateRangeByFrequency(startDateStr, endDateStr, frequency = 'monthly') {
     const dateRanges = [];
     
@@ -316,54 +315,88 @@ function splitDateRangeByFrequency(startDateStr, endDateStr, frequency = 'monthl
         // For yearly extraction
         if (frequency === 'yearly') {
             while (current <= endDate) {
-                const yearStart = new Date(current);
-                const yearEnd = new Date(current.getFullYear(), 11, 31); // December 31
+                const currentYear = current.getFullYear();
+                
+                // Use string construction to avoid timezone issues
+                const yearStart = new Date(`${currentYear}-01-01T00:00:00.000Z`);
+                const yearEnd = new Date(`${currentYear}-12-31T23:59:59.999Z`);
                 
                 const rangeEnd = yearEnd > endDate ? endDate : yearEnd;
                 
                 dateRanges.push({
-                    startDate: yearStart.toISOString().split('T')[0],
+                    startDate: `${currentYear}-01-01`,
                     endDate: rangeEnd.toISOString().split('T')[0]
                 });
                 
-                current = new Date(current.getFullYear() + 1, 0, 1); // January 1 of next year
+                // Move to next year
+                current = new Date(`${currentYear + 1}-01-01T00:00:00.000Z`);
             }
         }
         // For quarterly extraction
         else if (frequency === 'quarterly') {
             while (current <= endDate) {
-                const quarterStart = new Date(current);
+                const currentYear = current.getFullYear();
+                const currentQuarter = Math.floor(current.getMonth() / 3);
                 
-                const currentMonth = current.getMonth();
-                const quarterEndMonth = Math.floor(currentMonth / 3) * 3 + 2;
-                const quarterEndDate = new Date(current.getFullYear(), quarterEndMonth + 1, 0);
+                // Calculate quarter start and end
+                const quarterStartMonth = currentQuarter * 3;
+                const quarterEndMonth = quarterStartMonth + 2;
                 
-                const rangeEnd = quarterEndDate > endDate ? endDate : quarterEndDate;
+                const quarterStart = new Date(currentYear, quarterStartMonth, 1);
+                // Get last day of the quarter's last month
+                const quarterEnd = new Date(currentYear, quarterEndMonth + 1, 0); // Day 0 = last day of previous month
+                
+                // Use the actual end date if it's within this quarter
+                const rangeEnd = quarterEnd > endDate ? endDate : quarterEnd;
                 
                 dateRanges.push({
                     startDate: quarterStart.toISOString().split('T')[0],
                     endDate: rangeEnd.toISOString().split('T')[0]
                 });
                 
-                current = new Date(current.getFullYear(), quarterEndMonth + 1, 1);
+                // Move to next quarter
+                current = new Date(currentYear, quarterEndMonth + 1, 1);
             }
         }
-        // For monthly extraction
+        // For monthly extraction (FIXED LOGIC)
         else if (frequency === 'monthly') {
             while (current <= endDate) {
-                const monthStart = new Date(current);
-                const monthEnd = new Date(current.getFullYear(), current.getMonth() + 1, 0);
+                const currentYear = current.getFullYear();
+                const currentMonth = current.getMonth();
                 
+                // Month start: First day of current month
+                const monthStart = new Date(currentYear, currentMonth, 1);
+                
+                // Month end: Last day of current month (using day 0 of next month)
+                const monthEnd = new Date(currentYear, currentMonth + 1, 0); // This automatically handles leap years!
+                
+                // Use the actual end date if it's within this month
                 const rangeEnd = monthEnd > endDate ? endDate : monthEnd;
+                
+                // Debug logging for troubleshooting
+                console.log(`Month calculation: ${currentYear}-${String(currentMonth + 1).padStart(2, '0')}`, {
+                    monthStart: monthStart.toISOString().split('T')[0],
+                    monthEnd: monthEnd.toISOString().split('T')[0],
+                    rangeEnd: rangeEnd.toISOString().split('T')[0],
+                    daysInMonth: monthEnd.getDate()
+                });
                 
                 dateRanges.push({
                     startDate: monthStart.toISOString().split('T')[0],
                     endDate: rangeEnd.toISOString().split('T')[0]
                 });
                 
-                current = new Date(current.getFullYear(), current.getMonth() + 1, 1);
+                // Move to next month
+                current = new Date(currentYear, currentMonth + 1, 1);
             }
         }
+        
+        console.log(`Generated ${dateRanges.length} date ranges for frequency: ${frequency}`, {
+            originalRange: `${startDateStr} to ${endDateStr}`,
+            frequency: frequency,
+            ranges: dateRanges.slice(0, 5) // Log first 5 ranges for debugging
+        });
+        
     } catch (error) {
         throw new Error(`Error generating date ranges: ${error.message}`);
     }
