@@ -16,7 +16,9 @@ let MAX_FALLBACK_TIME = 60000; // Maximum fallback time in milliseconds (60 sec)
 let POLL_INTERVAL = 30000; // 30 seconds between polls
 let MAX_POLL_ATTEMPTS = 60; // Maximum 30 minutes
 let DOWNLOAD_TIMEOUT = 600000; // 10 minutes
-let SHOPIFY_API_VERSION = '2024-01';
+let SHOPIFY_API_VERSION = '2025-07';
+let EXTRACTION_LOG_TABLE_NAME = null;
+let EXTRACTION_DETAILS_TABLE_NAME = null;
 
 // =================== ERROR CODES ===================
 const RETRYABLE_ERROR_CODES = [
@@ -36,7 +38,9 @@ async function initializeConfiguration() {
         try {
             console.log("Initializing configuration from Azure Key Vault or local settings...");
             config = await loadConfig();
-            
+            EXTRACTION_LOG_TABLE_NAME = config.STORE_EXTRACTION_LOG_TABLE || 'StoreExtractionLog';
+            EXTRACTION_DETAILS_TABLE_NAME = config.STORE_EXTRACTION_DETAILS_TABLE || 'StoreExtractionDataDetails';
+
             // Load all configurable constants from Azure Key Vault or local settings
             FUNCTION_TIMEOUT_LIMIT = parseInt(config.FUNCTION_TIMEOUT_LIMIT) || 1740000; // 29 minutes
             MAX_RETRY_ATTEMPTS = parseInt(config.MAX_RETRY_ATTEMPTS) || 5;
@@ -65,18 +69,18 @@ async function initializeConfiguration() {
     return config;
 }
 
-// =================== AZURE FUNCTION HANDLERS ===================
-// app.timer("shopifyBulkOrderExtraction", {
-//     schedule: "0 0 2 * * *", // Daily at 2 AM
-//     handler: async (myTimer, context) => {
-//         return await shopifyBulkOrderExtractionHandler(context, myTimer);
-//     },
-// });
+//=================== AZURE FUNCTION HANDLERS ===================
+app.timer("shopifyBulkOrderExtraction", {
+    schedule: "0 0 */6 * * *", // Every 6 hours
+    handler: async (myTimer, context) => {
+        return await shopifyBulkOrderExtractionHandler(context, myTimer);
+    },
+});
 
 app.http("shopifyBulkOrderExtractionHttp", {
     methods: ["POST", "GET"],
     authLevel: "function",
-    route: "shopifyBulkOrderExtraction",
+    route: "exportBulkOrders",
     handler: async (request, context) => {
         return await shopifyBulkOrderExtractionHandler(context, request);
     },
@@ -105,25 +109,30 @@ async function shopifyBulkOrderExtractionHandler(context, triggerInput) {
         logsDirectory: logger.logsDir
     });
 
-    let response = {
-        status: 500,
+   let response = {
+        status: 200,
         headers: { "Content-Type": "application/json" },
-        body: {
+        body: JSON.stringify({  
             executionId,
-            success: false,
-            error: "Unknown error occurred",
+            success: true,
+            error: "Completed successfully",
             timestamp: startTime.toISOString(),
             logFile: logger.logFilePath,
-        }
+        }, null, 2)
     };
 
+    let extractionLogId = null;
+    const configData = await validateConfiguration();
+    const { tableClient, logTableClient } = await initializeAzureClients(configData, context);
     try {
-        const configData = await validateConfiguration();
-        const { tableClient } = await initializeAzureClients(configData, context);
-
         await withRetry(
             async () => await tableClient.createTable(),
             { maxRetries: 3, initialDelayMs: 1000, context: context, operationName: 'createTable' }
+        );
+        
+        await withRetry(
+            async () => await logTableClient.createTable(),
+            { maxRetries: 3, initialDelayMs: 1000, context: context, operationName: 'createLogTable' }
         );
         
         const extractionRecords = await getPendingExtractionRecords(tableClient, context);
@@ -143,19 +152,45 @@ async function shopifyBulkOrderExtractionHandler(context, triggerInput) {
         const endTime = new Date();
         const executionTime = endTime.getTime() - startTime.getTime();
 
+        const summary = {
+            totalRecords: extractionRecords.length,
+            filtered: recordsToProcess.length,
+            processed: results.processedCount,
+            skipped: results.skippedCount,
+            failed: results.failedCount,
+            executionTimeMs: executionTime,
+            executionTimeMinutes: Math.round(executionTime / 60000 * 100) / 100
+        };
+
+        // Determine overall status based on results
+        let overallStatus = 'completed';
+        let logErrorMessage = '';
+
+        // Check if all records were processed successfully
+        if (results.failedCount > 0) {
+            if (results.processedCount === 0) {
+                overallStatus = 'failed';
+                logErrorMessage = `All ${results.failedCount} records failed to process`;
+            } else {
+                overallStatus = 'completed_with_errors';
+                logErrorMessage = `${results.failedCount} out of ${recordsToProcess.length} records failed`;
+            }
+        } else if (results.processedCount === recordsToProcess.length) {
+            // All records processed successfully, mark as completed
+            overallStatus = 'completed';
+            logErrorMessage = '';
+        } else {
+            // Some records were skipped due to timeout or other reasons
+            overallStatus = 'completed_with_skips';
+            logErrorMessage = `${results.skippedCount} out of ${recordsToProcess.length} records were skipped`;
+        }
+
         const successResponse = {
             executionId,
+            extractionLogId,
             success: true,
             message: "Shopify Bulk Order Extraction completed",
-            summary: {
-                totalRecords: extractionRecords.length,
-                filtered: recordsToProcess.length,
-                processed: results.processedCount,
-                skipped: results.skippedCount,
-                failed: results.failedCount,
-                executionTimeMs: executionTime,
-                executionTimeMinutes: Math.round(executionTime / 60000 * 100) / 100
-            },
+            summary,
             timestamp: endTime.toISOString(),
             results: results.detailedResults,
             logFile: logger.logFilePath
@@ -165,7 +200,7 @@ async function shopifyBulkOrderExtractionHandler(context, triggerInput) {
             response = {
                 status: 200,
                 headers: { "Content-Type": "application/json" },
-                body: successResponse
+                body: JSON.stringify(successResponse, null, 2)
             };
         }
 
@@ -198,7 +233,7 @@ async function shopifyBulkOrderExtractionHandler(context, triggerInput) {
             response = {
                 status: 500,
                 headers: { "Content-Type": "application/json" },
-                body: errorResponse
+                body: JSON.stringify(errorResponse, null, 2)
             };
         }
 
@@ -217,7 +252,8 @@ async function validateConfiguration() {
         blobContainerName: config.BLOB_CONTAINER_NAME,
         tableStorageAccountName: config.AZURE_STORAGE_ACCOUNT_NAME,
         tableStorageAccountKey: config.AZURE_STORAGE_ACCOUNT_KEY,
-        tableName: config.TABLE_NAME || 'StoreExtractionDataDetails'
+        tableName: EXTRACTION_DETAILS_TABLE_NAME,
+        logTableName: EXTRACTION_LOG_TABLE_NAME
     };
 
     const requiredFields = [
@@ -238,6 +274,7 @@ async function validateConfiguration() {
     logger.info('Configuration validation successful', {
         configuredFields: Object.keys(configData).filter(key => configData[key]),
         tableName: configData.tableName,
+        logTableName: configData.logTableName,
         shopifyStore: configData.shopifyStoreUrl?.substring(0, 20) + '...',
         functionTimeoutLimit: FUNCTION_TIMEOUT_LIMIT,
         maxRetryAttempts: MAX_RETRY_ATTEMPTS,
@@ -264,13 +301,20 @@ async function initializeAzureClients(configData, context) {
             credential
         );
 
+        const logTableClient = new TableClient(
+            `https://${configData.tableStorageAccountName}.table.core.windows.net`,
+            configData.logTableName,
+            credential
+        );
+
         logger.info('Azure clients initialized successfully', {
             tableStorageAccount: configData.tableStorageAccountName,
             tableName: configData.tableName,
+            logTableName: configData.logTableName,
             blobContainer: configData.blobContainerName
         });
         
-        return { tableClient };
+        return { tableClient, logTableClient };
     } catch (error) {
         logger.error('Failed to initialize Azure clients:', {
             error: error.message,
