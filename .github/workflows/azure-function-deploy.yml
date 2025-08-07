@@ -2,9 +2,13 @@ name: Deploy to Azure Functions
 
 on:
   push:
-    branches: [ feature/v4-model-upgrade-V2 ]
+    branches: 
+      - staging
+      - main
   pull_request:
-    branches: [ feature/v4-model-upgrade-V2 ]
+    branches: 
+      - staging
+      - main
   workflow_dispatch:
     inputs:
       environment:
@@ -20,7 +24,7 @@ on:
 jobs:
   build-and-deploy:
     runs-on: windows-latest
-    environment: ${{ github.event.inputs.environment || 'dev' }}
+    environment: ${{ github.event.inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
    
     steps:
     - name: 'Checkout GitHub Action'
@@ -46,12 +50,12 @@ jobs:
       run: |
         # Best practice #11: Optimize cold start performance by minimizing package size
         npm prune --production
-        Write-Host "✅ Production dependencies prepared"
+        Write-Host "Production dependencies prepared"
        
     - name: 'Archive function app'
       shell: pwsh
       run: |
-        # Best practice #6: Package and deploy using zip deployment
+        
         $packagePath = "$env:RUNNER_TEMP\package.zip"
         Compress-Archive -Path ./* -DestinationPath $packagePath -Force
         Write-Host "Package created at: $packagePath"
@@ -59,30 +63,36 @@ jobs:
         # Verify the package exists
         if (Test-Path $packagePath) {
           $fileInfo = Get-Item $packagePath
-          Write-Host "✅ Package verified: $($fileInfo.Name) ($($fileInfo.Length) bytes)"
+          Write-Host "Package verified: $($fileInfo.Name) ($($fileInfo.Length) bytes)"
         } else {
-          Write-Error "❌ Package not found at $packagePath"
+          Write-Error "Package not found at $packagePath"
           exit 1
         }
        
     - name: 'Deploy to Function App'
       uses: Azure/functions-action@v1.5.3
       with:
-        app-name: 'shopify-data-extraction-dev'
-        publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
+        app-name: ${{ github.ref == 'refs/heads/main' && 'shopify-data-extraction-prod' || 'shopify-data-extraction-dev' }}
+        publish-profile: ${{ github.ref == 'refs/heads/main' && secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE_PROD || secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
         package: ${{ runner.temp }}\package.zip
        
     - name: 'Post-deployment validation'
       shell: pwsh
       run: |
         # Best practice #15: Monitor performance and set up alerts
-        Write-Host "Deployment completed to https://shopify-archive-function-dev.azurewebsites.net"
+        $appUrl = if ($env:GITHUB_REF -eq "refs/heads/main") { 
+          "https://shopify-data-extraction-prod.azurewebsites.net" 
+        } else { 
+          "https://shopify-archive-function-dev.azurewebsites.net" 
+        }
+        
+        Write-Host "Deployment completed to $appUrl"
        
         Start-Sleep -Seconds 30
         try {
-          $response = Invoke-WebRequest -Uri "https://shopify-archive-function-dev.azurewebsites.net" -Method GET -TimeoutSec 30
-          Write-Host "✅ Function App is responding (Status: $($response.StatusCode))"
+          $response = Invoke-WebRequest -Uri $appUrl -Method GET -TimeoutSec 30
+          Write-Host "Function App is responding (Status: $($response.StatusCode))"
         }
         catch {
-          Write-Host "⚠️ Function App validation completed"
+          Write-Host "Function App validation completed"
         }
