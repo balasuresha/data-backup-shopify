@@ -560,7 +560,9 @@ async function processExtractionRecord(record, configData, tableClient, context)
             downloadUrl,
             rowKey,
             context,
-            storeName || partitionKey
+            storeName || partitionKey,
+            extractionStartDate,
+            extractionEndDate
         );
         
         // Step 4: Update record as completed
@@ -985,12 +987,14 @@ class ShopifyBulkAPI {
 }
 
 // =================== RAW DATA DOWNLOAD AND UPLOAD ===================
-async function downloadAndUploadRawData(configData, downloadUrl, recordId, context, storeName) {
+async function downloadAndUploadRawData(configData, downloadUrl, recordId, context, storeName, extractionStartDate, extractionEndDate) {
     try {
         logger.info('Starting raw JSONL data download and upload', {
             downloadUrl: downloadUrl.substring(0, 100) + '...',
             recordId,
-            storeName
+            storeName,
+            extractionStartDate,
+            extractionEndDate
         });
         
         // Initialize Azure Blob Storage client
@@ -1003,16 +1007,25 @@ async function downloadAndUploadRawData(configData, downloadUrl, recordId, conte
             { maxRetries: 3, initialDelayMs: 1000, context: context, operationName: 'createContainer' }
         );
 
-        // Create blob name with timestamp
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        // Format dates without time for blob name (YYYY-MM-DD format)
+        const formatDateForBlob = (dateString) => {
+            const date = new Date(dateString);
+            return date.toISOString().split('T')[0]; // Returns YYYY-MM-DD
+        };
+
+        const startDateFormatted = formatDateForBlob(extractionStartDate);
+        const endDateFormatted = formatDateForBlob(extractionEndDate);
+        
+        // Create blob name with extraction date range instead of timestamp
         const directoryName = storeName.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
-        const blobName = `${directoryName}/shopify-orders-raw-${recordId}-${timestamp}.jsonl`;
+        const blobName = `${storeName}/orders/shopify-orders-raw-${directoryName}_${startDateFormatted}_${endDateFormatted}.jsonl`;
         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
 
         logger.info('Downloading data from Shopify and uploading to Azure Blob', {
             blobName,
-            directoryName,
-            containerName: configData.blobContainerName
+            storeName,
+            containerName: configData.blobContainerName,
+            dateRange: `${startDateFormatted} to ${endDateFormatted}`
         });
 
         // Download from Shopify and upload directly to blob as stream
@@ -1048,7 +1061,8 @@ async function downloadAndUploadRawData(configData, downloadUrl, recordId, conte
                         metadata: {
                             recordId: recordId,
                             storeName: directoryName,
-                            extractionDate: timestamp,
+                            extractionStartDate: startDateFormatted,
+                            extractionEndDate: endDateFormatted,
                             contentType: 'shopify-orders-raw',
                             source: 'shopify-bulk-api',
                             configSource: 'azure-keyvault'
@@ -1068,7 +1082,8 @@ async function downloadAndUploadRawData(configData, downloadUrl, recordId, conte
             blobUrl,
             fileSizeBytes,
             fileSizeKB: Math.round(fileSizeBytes / 1024),
-            fileSizeMB: Math.round(fileSizeBytes / (1024 * 1024))
+            fileSizeMB: Math.round(fileSizeBytes / (1024 * 1024)),
+            dateRange: `${startDateFormatted} to ${endDateFormatted}`
         });
         
         return { blobUrl, fileSizeBytes };
@@ -1078,7 +1093,9 @@ async function downloadAndUploadRawData(configData, downloadUrl, recordId, conte
             error: error.message,
             stack: error.stack,
             recordId,
-            storeName
+            storeName,
+            extractionStartDate,
+            extractionEndDate
         });
         throw error;
     }
