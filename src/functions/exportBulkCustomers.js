@@ -1664,16 +1664,13 @@ class ShopifyBulkAPI {
     const containerClient = blobServiceClient.getContainerClient(containerName);
 
     // Extract store name from shopDomain
-    const storeName = this.shopDomain
-      .replace(/\.myshopify\.com$/i, "")
-      .replace(/[^a-z0-9]/gi, "_");
+    const storeName = this.shopDomain.replace(/[^a-zA-Z0-9_-]/g, '_').toLowerCase();
 
     // Create folder structure: storename/customers/executionId/
-    const folderPath = `${storeName}/customers/${executionId}/`;
-
-    // Generate unique file name: storename_customers_executionId_timestamp.jsonl
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const fileName = `${storeName}_customers_${executionId}_${timestamp}_${approach}.jsonl`;
+    const now = new Date();
+    const folderPath = `${storeName}/customers/`;
+    const dateString = `${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}-${String(now.getFullYear()).slice(-2)}`;
+    const fileName = `${storeName}_customers_${dateString}.jsonl`;
     const blobPath = folderPath + fileName;
 
     const blobClient = containerClient.getBlockBlobClient(blobPath);
